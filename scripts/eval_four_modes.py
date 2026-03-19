@@ -1,6 +1,14 @@
 #!/usr/bin/env python
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SRC_DIR = REPO_ROOT / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
 import argparse
 import json
 from pathlib import Path
@@ -8,10 +16,10 @@ from pathlib import Path
 import torch
 from transformers import AutoTokenizer
 
-from bvou_ppo.data import load_task_examples
-from bvou_ppo.eval import run_task_eval
-from bvou_ppo.modes import FOUR_MODES
-from bvou_ppo.models.policy_value_model import PolicyWithValueHead
+from beippo.data import load_task_examples
+from beippo.eval import run_task_eval
+from beippo.modes import FOUR_MODES
+from beippo.models.policy_value_model import PolicyWithValueHead
 
 
 def load_run_config(run_dir: Path) -> dict:

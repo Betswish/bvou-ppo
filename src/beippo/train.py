@@ -12,16 +12,16 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm.auto import tqdm
 from transformers import AutoModelForCausalLM
 
-from bvou_ppo.config import ExperimentConfig
-from bvou_ppo.data import TaskExample, load_task_examples
-from bvou_ppo.eval import run_task_eval
-from bvou_ppo.modeling import count_trainable_parameters, extract_block_index, freeze_all_parameters, maybe_enable_gradient_checkpointing
-from bvou_ppo.models.policy_value_model import PolicyWithValueHead, apply_lora, build_tokenizer
-from bvou_ppo.ppo import RolloutBatch, build_response_mask, compute_returns_and_advantages, ppo_loss, shift_logprobs
-from bvou_ppo.registry import resolve_model
-from bvou_ppo.reward import exact_match_reward
-from bvou_ppo.selector import BlockSelector
-from bvou_ppo.utils import JsonlLogger, peak_memory_gb, reset_peak_memory_stats, set_seed
+from beippo.config import ExperimentConfig
+from beippo.data import TaskExample, load_task_examples
+from beippo.eval import run_task_eval
+from beippo.modeling import count_trainable_parameters, extract_block_index, freeze_all_parameters, maybe_enable_gradient_checkpointing
+from beippo.models.policy_value_model import PolicyWithValueHead, apply_lora, build_tokenizer
+from beippo.ppo import RolloutBatch, build_response_mask, compute_returns_and_advantages, ppo_loss, shift_logprobs
+from beippo.registry import resolve_model
+from beippo.reward import exact_match_reward
+from beippo.selector import BlockSelector
+from beippo.utils import JsonlLogger, peak_memory_gb, reset_peak_memory_stats, set_seed
 
 
 class ExampleDataset(Dataset):

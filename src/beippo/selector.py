@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 
-from bvou_ppo.modeling import get_decoder_layers
+from beippo.modeling import get_decoder_layers
 
 
 @dataclass

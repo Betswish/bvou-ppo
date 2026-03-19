@@ -1,5 +1,5 @@
-from bvou_ppo.config import ExperimentConfig
-from bvou_ppo.modes import apply_mode
+from beippo.config import ExperimentConfig
+from beippo.modes import apply_mode
 
 
 def test_apply_mode_full():

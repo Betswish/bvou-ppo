@@ -1,4 +1,4 @@
-from bvou_ppo.reward import exact_match_reward, normalize_prediction
+from beippo.reward import exact_match_reward, normalize_prediction
 
 
 def test_boolq_reward():

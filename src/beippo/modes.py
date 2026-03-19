@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 
-from bvou_ppo.config import ExperimentConfig
+from beippo.config import ExperimentConfig
 
 
 FOUR_MODES = ("full", "lora", "bvou", "bvou_lora")

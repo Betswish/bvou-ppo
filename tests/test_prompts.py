@@ -1,5 +1,5 @@
-from bvou_ppo.prompts import build_task_user_prompt, default_system_prompt
-from bvou_ppo.registry import MODEL_REGISTRY
+from beippo.prompts import build_task_user_prompt, default_system_prompt
+from beippo.registry import MODEL_REGISTRY
 
 
 def test_boolq_prompt_builder():

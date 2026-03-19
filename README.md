@@ -1,4 +1,4 @@
-# bvou-ppo
+# beippo
 
 A research scaffold for testing **block-selective PPO updates** on **short-output classification-style tasks**.
 
@@ -104,7 +104,7 @@ train:
 ## Repo layout
 
 ```text
-bvou-ppo/
+beippo/
 ├── configs/
 │   ├── qwen35_4b_boolq.yaml
 │   ├── qwen35_9b_commonsenseqa.yaml
@@ -115,7 +115,7 @@ bvou-ppo/
 │   ├── run_four_modes.py
 │   ├── eval_four_modes.py
 │   └── make_results_table.py
-├── src/bvou_ppo/
+├── src/beippo/
 │   ├── config.py
 │   ├── data.py
 │   ├── eval.py

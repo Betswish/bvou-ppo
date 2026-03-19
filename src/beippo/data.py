@@ -4,8 +4,8 @@ from dataclasses import dataclass
 
 from datasets import load_dataset
 
-from bvou_ppo.prompts import build_task_user_prompt, render_chat_prompt
-from bvou_ppo.registry import resolve_model
+from beippo.prompts import build_task_user_prompt, render_chat_prompt
+from beippo.registry import resolve_model
 
 
 @dataclass

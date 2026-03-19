@@ -1,11 +1,19 @@
 #!/usr/bin/env python
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SRC_DIR = REPO_ROOT / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
 import argparse
 
-from bvou_ppo.config import load_config
-from bvou_ppo.modes import apply_mode, FOUR_MODES
-from bvou_ppo.train import run_training
+from beippo.config import load_config
+from beippo.modes import apply_mode, FOUR_MODES
+from beippo.train import run_training
 
 
 if __name__ == "__main__":

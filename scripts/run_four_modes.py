@@ -1,6 +1,14 @@
 #!/usr/bin/env python
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SRC_DIR = REPO_ROOT / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
 import argparse
 import subprocess
 import sys
@@ -9,8 +17,8 @@ from pathlib import Path
 
 import yaml
 
-from bvou_ppo.config import load_config
-from bvou_ppo.modes import FOUR_MODES, apply_mode
+from beippo.config import load_config
+from beippo.modes import FOUR_MODES, apply_mode
 
 
 def build_command(mode_config_path: Path, launcher: str, accelerate_config: str | None) -> list[str]:

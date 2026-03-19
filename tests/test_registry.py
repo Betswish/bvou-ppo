@@ -1,4 +1,4 @@
-from bvou_ppo.registry import resolve_model
+from beippo.registry import resolve_model
 
 
 def test_qwen_registry():

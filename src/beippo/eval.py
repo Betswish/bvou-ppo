@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import torch
 from tqdm.auto import tqdm
 
-from bvou_ppo.reward import exact_match_reward
+from beippo.reward import exact_match_reward
 
 
 @dataclass

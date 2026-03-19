@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from bvou_ppo.registry import ModelSpec
+from beippo.registry import ModelSpec
 
 
 @dataclass
