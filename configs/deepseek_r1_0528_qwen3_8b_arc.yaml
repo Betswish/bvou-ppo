@@ -1,0 +1,25 @@
+train:
+  run_name: deepseek_r1_0528_qwen3_8b_arc
+  output_dir: outputs/deepseek_r1_0528_qwen3_8b_arc
+  model_name_or_path: deepseek-ai/DeepSeek-R1-0528-Qwen3-8B
+  model_family: deepseek_r1_0528
+  task_name: arc_challenge
+  train_split: train
+  eval_splits: [validation]
+  enable_thinking: false
+  use_official_system_prompt: true
+  deepseek_prompt_date: 2026年3月19日，星期四
+  max_train_samples: 2250
+  max_eval_samples: 570
+  per_device_batch_size: 1
+  gradient_accumulation_steps: 16
+  response_max_new_tokens: 8
+  num_train_steps: 500
+  learning_rate: 1.0e-5
+  full_tune: false
+lora:
+  enabled: true
+selector:
+  enabled: true
+  top_k: 8
+  search_upper_half_only: true

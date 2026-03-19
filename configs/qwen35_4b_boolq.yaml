@@ -1,0 +1,23 @@
+train:
+  run_name: qwen35_4b_boolq
+  output_dir: outputs/qwen35_4b_boolq
+  model_name_or_path: Qwen/Qwen3.5-4B
+  model_family: qwen35
+  task_name: boolq
+  train_split: train
+  eval_splits: [validation]
+  enable_thinking: false
+  use_official_system_prompt: false
+  max_train_samples: 5000
+  max_eval_samples: 500
+  per_device_batch_size: 2
+  gradient_accumulation_steps: 8
+  response_max_new_tokens: 8
+  num_train_steps: 500
+  learning_rate: 1.0e-5
+  full_tune: false
+lora:
+  enabled: true
+selector:
+  enabled: true
+  top_k: 6

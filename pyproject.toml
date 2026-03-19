@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bvou-ppo"
+version = "0.2.0"
+description = "Block-selective PPO experiments with short-output evaluation for Qwen3.5 and DeepSeek-R1-0528 distills"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "OpenAI ChatGPT" }]
+dependencies = [
+  "accelerate>=1.1.0",
+  "datasets>=3.0.0",
+  "numpy>=1.26.0",
+  "peft>=0.13.0",
+  "PyYAML>=6.0.1",
+  "regex>=2024.9.11",
+  "safetensors>=0.4.5",
+  "torch>=2.3.0",
+  "transformers>=4.46.0",
+  "tqdm>=4.66.0"
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0.0", "ruff>=0.8.0"]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
