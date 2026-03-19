@@ -43,7 +43,7 @@ selector:
   search_upper_half_only: true
   active_only_optimizer_state: false
 rollouts:
-  save_train_rollouts: false
-  save_eval_rollouts: false
+  save_train_rollouts: true
+  save_eval_rollouts: true
   max_train_rollouts_per_save: 0
   max_eval_rollouts_per_save: 0
