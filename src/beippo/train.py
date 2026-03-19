@@ -53,6 +53,37 @@ def collate_examples(batch):
 def _is_lora_param(name: str) -> bool:
     return "lora_" in name
 
+def configure_prepare_trainable_parameters(model, selector_enabled: bool, full_tune: bool, lora_enabled: bool):
+    freeze_all_parameters(model)
+    for p in model.value_head.parameters():
+        p.requires_grad_(True)
+
+    if full_tune and not selector_enabled:
+        for name, param in model.named_parameters():
+            if not name.startswith("value_head"):
+                param.requires_grad_(True)
+        return
+
+    if lora_enabled and not selector_enabled:
+        for name, param in model.named_parameters():
+            if _is_lora_param(name):
+                param.requires_grad_(True)
+        return
+
+    if selector_enabled:
+        for name, param in model.named_parameters():
+            if name.startswith("value_head"):
+                continue
+            block_idx = extract_block_index(name)
+            if block_idx is None:
+                continue
+            if lora_enabled:
+                if _is_lora_param(name):
+                    param.requires_grad_(True)
+            else:
+                if not _is_lora_param(name):
+                    param.requires_grad_(True)
+                    
 
 def configure_trainable_parameters(model, selected_blocks, full_tune, lora_enabled):
     """Toggle requires_grad for the current training mode.
@@ -389,8 +420,16 @@ def run_training(cfg: ExperimentConfig) -> None:
     )
     train_loader = DataLoader(ExampleDataset(train_examples), batch_size=cfg.train.per_device_batch_size, shuffle=True, collate_fn=collate_examples)
 
-    configure_trainable_parameters(model, None, cfg.train.full_tune and not cfg.selector.enabled, cfg.lora.enabled and not cfg.selector.enabled)
+    # configure_trainable_parameters(model, None, cfg.train.full_tune and not cfg.selector.enabled, cfg.lora.enabled and not cfg.selector.enabled)
+    # optimizer = build_optimizer(model, cfg.train.learning_rate, cfg.train.weight_decay)
+    configure_prepare_trainable_parameters(
+        model,
+        selector_enabled=cfg.selector.enabled,
+        full_tune=cfg.train.full_tune,
+        lora_enabled=cfg.lora.enabled,
+    )
     optimizer = build_optimizer(model, cfg.train.learning_rate, cfg.train.weight_decay)
+
     model, optimizer, train_loader = accelerator.prepare(model, optimizer, train_loader)
     reference_model.to(accelerator.device)
 
