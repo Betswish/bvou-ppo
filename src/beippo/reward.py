@@ -4,14 +4,28 @@ import re
 
 
 LETTER_RE = re.compile(r"\b([A-E])\b", re.IGNORECASE)
-YESNO_RE = re.compile(r"\b(yes|no)\b", re.IGNORECASE)
+BOOL_RE = re.compile(r"\b(yes|no|true|false|y|n)\b", re.IGNORECASE)
+THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.IGNORECASE | re.DOTALL)
+
+
+def _clean_text(text: str) -> str:
+    text = THINK_BLOCK_RE.sub(" ", text)
+    text = text.replace("<|im_start|>", " ").replace("<|im_end|>", " ")
+    return text.strip()
 
 
 def normalize_prediction(task_name: str, text: str) -> str | None:
-    text = text.strip()
+    text = _clean_text(text)
     if task_name == "boolq":
-        match = YESNO_RE.search(text)
-        return match.group(1).lower() if match else None
+        match = BOOL_RE.search(text)
+        if not match:
+            return None
+        token = match.group(1).lower()
+        if token in {"yes", "true", "y"}:
+            return "yes"
+        if token in {"no", "false", "n"}:
+            return "no"
+        return None
     if task_name in {"commonsenseqa", "arc_challenge"}:
         match = LETTER_RE.search(text.upper())
         return match.group(1).upper() if match else None

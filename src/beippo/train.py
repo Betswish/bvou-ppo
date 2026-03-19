@@ -125,6 +125,7 @@ def generate_rollout_batch(accelerator, model, reference_model, tokenizer, batch
         do_sample=True,
         temperature=spec.recommended_temperature,
         top_p=spec.recommended_top_p,
+        min_new_tokens=1,
         max_new_tokens=cfg.train.response_max_new_tokens,
         pad_token_id=tokenizer.pad_token_id,
         eos_token_id=tokenizer.eos_token_id,

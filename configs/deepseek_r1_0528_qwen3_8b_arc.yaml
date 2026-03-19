@@ -7,7 +7,7 @@ train:
   train_split: train
   eval_splits: [validation]
   enable_thinking: false
-  use_official_system_prompt: true
+  use_official_system_prompt: false
   deepseek_prompt_date: 2026年3月19日，星期四
   max_train_samples: 2250
   max_eval_samples: 570
@@ -18,8 +18,11 @@ train:
   learning_rate: 1.0e-5
   full_tune: false
 lora:
-  enabled: true
+  enabled: false
 selector:
-  enabled: true
+  enabled: false
   top_k: 8
   search_upper_half_only: true
+rollouts:
+  save_train_rollouts: false
+  save_eval_rollouts: false

@@ -50,16 +50,25 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
 
 
 def resolve_model(model_alias_or_id: str) -> ModelSpec:
-    return MODEL_REGISTRY.get(
-        model_alias_or_id,
-        ModelSpec(
-            alias=model_alias_or_id,
-            hf_id=model_alias_or_id,
-            family="generic",
-            default_enable_thinking=False,
-            supports_enable_thinking=False,
-            use_official_system_prompt=False,
-            recommended_temperature=0.7,
-            recommended_top_p=0.9,
-        ),
+    # Accept either the short alias (e.g. qwen35_4b) or the full HF id
+    # (e.g. Qwen/Qwen3.5-4B). This avoids silently falling back to the
+    # generic model path, which would skip family-specific chat-template args
+    # such as enable_thinking for Qwen 3.5.
+    if model_alias_or_id in MODEL_REGISTRY:
+        return MODEL_REGISTRY[model_alias_or_id]
+
+    needle = model_alias_or_id.strip().lower()
+    for spec in MODEL_REGISTRY.values():
+        if spec.hf_id.lower() == needle or spec.alias.lower() == needle:
+            return spec
+
+    return ModelSpec(
+        alias=model_alias_or_id,
+        hf_id=model_alias_or_id,
+        family="generic",
+        default_enable_thinking=False,
+        supports_enable_thinking=False,
+        use_official_system_prompt=False,
+        recommended_temperature=0.7,
+        recommended_top_p=0.9,
     )

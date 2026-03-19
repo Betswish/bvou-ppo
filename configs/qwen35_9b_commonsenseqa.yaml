@@ -17,8 +17,11 @@ train:
   learning_rate: 1.0e-5
   full_tune: false
 lora:
-  enabled: true
+  enabled: false
 selector:
-  enabled: true
+  enabled: false
   top_k: 8
   search_upper_half_only: true
+rollouts:
+  save_train_rollouts: false
+  save_eval_rollouts: false

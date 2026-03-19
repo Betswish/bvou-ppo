@@ -9,3 +9,8 @@ def test_boolq_reward():
 def test_option_reward():
     assert normalize_prediction("commonsenseqa", "The answer is C") == "C"
     assert exact_match_reward("arc_challenge", "B", "B") == 1.0
+
+
+def test_boolq_reward_accepts_true_false_and_think_tags():
+    assert normalize_prediction("boolq", "true") == "yes"
+    assert normalize_prediction("boolq", "<think>foo</think> false") == "no"

@@ -28,6 +28,7 @@ def run_task_eval(model, tokenizer, task_name: str, split: str, examples, batch_
         generations = model.generate(
             **tokens,
             do_sample=False,
+            min_new_tokens=1,
             max_new_tokens=max_new_tokens,
             pad_token_id=tokenizer.pad_token_id,
             eos_token_id=tokenizer.eos_token_id,
