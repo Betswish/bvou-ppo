@@ -1,4 +1,4 @@
-# bvou-ppo
+# beippo
 
 A research scaffold for testing **block-selective PPO updates** on **short-output classification-style tasks**.
 
@@ -6,15 +6,13 @@ This repo is built around one question:
 
 > Can PPO-style value supervision be turned into a useful **block selection signal**, so we update only part of a decoder-only LLM while preserving task performance?
 
-Instead of long chain-of-thought math rollouts, this version focuses on **short, exact-match outputs** like `yes/no` or `A/B/C/D/E`. That keeps the experiment centered on the **update-allocation mechanism** rather than long generation windows.
+This version focuses on **short, exact-match outputs** like `yes/no` or `A/B/C/D/E`. That keeps the experiment centered on the **update-allocation mechanism** rather than long generation windows.
 
 ---
 
 ## What is in this repo
 
-### Supported model families
-
-This repo currently has first-class configs and prompt handling for:
+### Supported models
 
 - `Qwen/Qwen3.5-4B`
 - `Qwen/Qwen3.5-9B`
@@ -26,116 +24,14 @@ This repo currently has first-class configs and prompt handling for:
 - `commonsenseqa`
 - `arc_challenge`
 
-All three are evaluated with **exact-match reward / exact-match accuracy**.
-
 ### Supported training modes
 
-The repo supports four comparison modes:
+- `full`
+- `lora`
+- `bvou`
+- `bvou_lora`
 
-1. `full` — full-parameter PPO tuning
-2. `lora` — PPO tuning with LoRA adapters
-3. `bvou` — block-selective PPO tuning
-4. `bvou_lora` — block-selective PPO with LoRA adapters
-
-These same four modes can be run either one by one or through the batch runner.
-
----
-
-## Core idea
-
-The motivating object is a **block update utility**:
-
-\[
-U_b(\theta, \Delta\theta_b) = J(\theta + \Delta\theta_b) - J(\theta)
-\]
-
-where only block `b` is updated.
-
-In practice, this repo does **not** assume PPO's standard value head is already a block-value estimator. Instead, it uses the PPO objective to derive a **block saliency proxy**, then updates only the top-k blocks.
-
-The default selector is a **gate-gradient scout pass**:
-
-- add one scalar gate per transformer block
-- backpropagate the PPO loss to those gates
-- rank blocks by gate-gradient magnitude
-- update only the selected blocks
-
-This is a **research proxy**, not a theorem-proof exact counterfactual estimator.
-
----
-
-## Prompting behavior
-
-All prompts are rendered with the model tokenizer's **official chat template** through:
-
-```python
- tokenizer.apply_chat_template(...)
-```
-
-### Qwen3.5
-
-- uses the official chat template
-- supports `enable_thinking=False`
-- default in the provided configs: **thinking off**
-- default in the provided configs: **no extra official system prompt**
-
-### DeepSeek-R1-0528-Qwen3-8B
-
-- uses the official chat template
-- default config currently sets:
-  - `enable_thinking: false`
-  - `use_official_system_prompt: true`
-- the official system prompt can be disabled in config with:
-
-```yaml
-train:
-  use_official_system_prompt: false
-```
-
-The DeepSeek prompt date string is configurable through:
-
-```yaml
-train:
-  deepseek_prompt_date: 2026年3月19日，星期四
-```
-
----
-
-## Repo layout
-
-```text
-bvou-ppo/
-├── configs/
-│   ├── qwen35_4b_boolq.yaml
-│   ├── qwen35_9b_commonsenseqa.yaml
-│   └── deepseek_r1_0528_qwen3_8b_arc.yaml
-├── scripts/
-│   ├── train_short_ppo.py
-│   ├── eval_short_tasks.py
-│   ├── run_four_modes.py
-│   ├── eval_four_modes.py
-│   └── make_results_table.py
-├── src/bvou_ppo/
-│   ├── config.py
-│   ├── data.py
-│   ├── eval.py
-│   ├── modeling.py
-│   ├── modes.py
-│   ├── ppo.py
-│   ├── prompts.py
-│   ├── registry.py
-│   ├── reward.py
-│   ├── selector.py
-│   ├── train.py
-│   ├── utils.py
-│   └── models/
-│       └── policy_value_model.py
-└── tests/
-    ├── test_modes.py
-    ├── test_prompts.py
-    ├── test_registry.py
-    └── test_reward.py
-```
+All tasks are evaluated with exact-match accuracy.
 
 ---
 
@@ -146,241 +42,465 @@ Python 3.10+ is recommended.
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install -U pip
-pip install -e .
+python -m pip install -U pip
+python -m pip install -e .
 ```
 
 ---
 
-## Quick start
+## Launchers: why there are both Accelerate and DeepSpeed configs
 
-### 1) Train a single config directly
+The repo uses:
+
+- **Accelerate** as the launcher / distributed orchestration layer
+- **DeepSpeed** as the ZeRO backend
+
+So a command like this:
 
 ```bash
-python scripts/train_short_ppo.py --config configs/qwen35_4b_boolq.yaml
+accelerate launch --config_file accelerate/zero2.yaml ...
 ```
 
-### 2) Override the mode from the command line
+means:
 
-```bash
-python scripts/train_short_ppo.py \
-  --config configs/qwen35_4b_boolq.yaml \
-  --mode bvou_lora
+- `accelerate/zero2.yaml` controls how Accelerate launches the job
+- that YAML points to `deepspeed/zero2.json`
+- `deepspeed/zero2.json` controls the actual ZeRO partitioning behavior
+
+Available launcher configs:
+
+- `accelerate/zero1.yaml`
+- `accelerate/zero2.yaml`
+- `accelerate/zero3.yaml`
+
+Available DeepSpeed backends:
+
+- `deepspeed/zero1.json`
+- `deepspeed/zero2.json`
+- `deepspeed/zero3.json`
+
+For most runs, start with **ZeRO-2**.
+
+---
+
+## Config layout
+
+The experiment matrix lives under:
+
+```text
+configs/matrix/
 ```
 
-Supported values for `--mode`:
+Each config is fully explicit and already fixes:
+
+- model
+- task
+- mode
+- output directory
+- run name
+- thinking/system-prompt behavior
+- train split / eval splits
+- training sample count / evaluation sample count
+- train steps / eval cadence / save cadence
+- batch size / grad accumulation
+- prompt length / response length
+- learning rate / weight decay / warmup ratio
+- bf16 / gradient checkpointing
+- selector settings
+- rollout-saving settings
+
+Config naming pattern:
+
+```text
+configs/matrix/<model>_<task>_<mode>.yaml
+```
+
+Examples:
+
+- `configs/matrix/qwen35_4b_boolq_full.yaml`
+- `configs/matrix/qwen35_4b_boolq_lora.yaml`
+- `configs/matrix/qwen35_4b_boolq_bvou.yaml`
+- `configs/matrix/qwen35_4b_boolq_bvou_lora.yaml`
+
+
+## What is now explicit in every matrix YAML
+
+All 36 files under `configs/matrix/` now explicitly include the core experiment-budget fields instead of relying on hidden defaults.
+
+At minimum, every matrix YAML now spells out:
+
+```yaml
+train:
+  train_split: train
+  eval_splits: [validation]
+  max_train_samples: ...
+  max_eval_samples: ...
+  num_train_steps: ...
+  per_device_batch_size: ...
+  gradient_accumulation_steps: ...
+  prompt_max_length: 768
+  response_max_new_tokens: 8
+  learning_rate: ...
+  weight_decay: 0.01
+  warmup_ratio: 0.03
+  bf16: true
+  gradient_checkpointing: true
+  eval_every: 100
+  save_every: 100
+```
+
+That means you can now inspect a single YAML and immediately know:
+
+- how many training samples were used
+- how many evaluation samples were used
+- how many optimizer steps were run
+- what effective batch/accumulation setup was used
+- what sequence-length budget was allowed
+
+There is no need to look up these values in code defaults for the official matrix runs.
+
+## Default budget choices used in the matrix configs
+
+The matrix configs currently use these task/model budgets:
+
+### Task sample counts
+
+- `boolq`: `max_train_samples = 5000`, `max_eval_samples = 500`
+- `commonsenseqa`: `max_train_samples = 8000`, `max_eval_samples = 1000`
+- `arc_challenge`: `max_train_samples = 2250`, `max_eval_samples = 570`
+
+### Shared training/eval cadence
+
+- `num_train_steps = 500`
+- `eval_every = 100`
+- `save_every = 100`
+- `prompt_max_length = 768`
+- `response_max_new_tokens = 8`
+- `weight_decay = 0.01`
+- `warmup_ratio = 0.03`
+- `bf16 = true`
+
+### Batch sizing by model family
+
+- `Qwen/Qwen3.5-4B`: `per_device_batch_size = 2`, `gradient_accumulation_steps = 8`
+- `Qwen/Qwen3.5-9B`: `per_device_batch_size = 1`, `gradient_accumulation_steps = 16`
+- `deepseek-ai/DeepSeek-R1-0528-Qwen3-8B`: `per_device_batch_size = 1`, `gradient_accumulation_steps = 16`
+
+If you want to change the experiment budget, edit the YAML directly; for the official matrix, the YAML is now the source of truth.
+
+---
+
+## Full experiment matrix
+
+### Models
+
+- `qwen35_4b`
+- `qwen35_9b`
+- `deepseek_r1_0528_qwen3_8b`
+
+### Tasks
+
+- `boolq`
+- `commonsenseqa`
+- `arc_challenge`
+
+### Modes
 
 - `full`
 - `lora`
 - `bvou`
 - `bvou_lora`
 
-### 3) Evaluate a single checkpoint
+That gives **36 ready-to-run YAML files**.
+
+### All config file names
+
+#### Qwen3.5-4B
+
+- `configs/matrix/qwen35_4b_boolq_full.yaml`
+- `configs/matrix/qwen35_4b_boolq_lora.yaml`
+- `configs/matrix/qwen35_4b_boolq_bvou.yaml`
+- `configs/matrix/qwen35_4b_boolq_bvou_lora.yaml`
+- `configs/matrix/qwen35_4b_commonsenseqa_full.yaml`
+- `configs/matrix/qwen35_4b_commonsenseqa_lora.yaml`
+- `configs/matrix/qwen35_4b_commonsenseqa_bvou.yaml`
+- `configs/matrix/qwen35_4b_commonsenseqa_bvou_lora.yaml`
+- `configs/matrix/qwen35_4b_arc_challenge_full.yaml`
+- `configs/matrix/qwen35_4b_arc_challenge_lora.yaml`
+- `configs/matrix/qwen35_4b_arc_challenge_bvou.yaml`
+- `configs/matrix/qwen35_4b_arc_challenge_bvou_lora.yaml`
+
+#### Qwen3.5-9B
+
+- `configs/matrix/qwen35_9b_boolq_full.yaml`
+- `configs/matrix/qwen35_9b_boolq_lora.yaml`
+- `configs/matrix/qwen35_9b_boolq_bvou.yaml`
+- `configs/matrix/qwen35_9b_boolq_bvou_lora.yaml`
+- `configs/matrix/qwen35_9b_commonsenseqa_full.yaml`
+- `configs/matrix/qwen35_9b_commonsenseqa_lora.yaml`
+- `configs/matrix/qwen35_9b_commonsenseqa_bvou.yaml`
+- `configs/matrix/qwen35_9b_commonsenseqa_bvou_lora.yaml`
+- `configs/matrix/qwen35_9b_arc_challenge_full.yaml`
+- `configs/matrix/qwen35_9b_arc_challenge_lora.yaml`
+- `configs/matrix/qwen35_9b_arc_challenge_bvou.yaml`
+- `configs/matrix/qwen35_9b_arc_challenge_bvou_lora.yaml`
+
+#### DeepSeek-R1-0528-Qwen3-8B
+
+- `configs/matrix/deepseek_r1_0528_qwen3_8b_boolq_full.yaml`
+- `configs/matrix/deepseek_r1_0528_qwen3_8b_boolq_lora.yaml`
+- `configs/matrix/deepseek_r1_0528_qwen3_8b_boolq_bvou.yaml`
+- `configs/matrix/deepseek_r1_0528_qwen3_8b_boolq_bvou_lora.yaml`
+- `configs/matrix/deepseek_r1_0528_qwen3_8b_commonsenseqa_full.yaml`
+- `configs/matrix/deepseek_r1_0528_qwen3_8b_commonsenseqa_lora.yaml`
+- `configs/matrix/deepseek_r1_0528_qwen3_8b_commonsenseqa_bvou.yaml`
+- `configs/matrix/deepseek_r1_0528_qwen3_8b_commonsenseqa_bvou_lora.yaml`
+- `configs/matrix/deepseek_r1_0528_qwen3_8b_arc_challenge_full.yaml`
+- `configs/matrix/deepseek_r1_0528_qwen3_8b_arc_challenge_lora.yaml`
+- `configs/matrix/deepseek_r1_0528_qwen3_8b_arc_challenge_bvou.yaml`
+- `configs/matrix/deepseek_r1_0528_qwen3_8b_arc_challenge_bvou_lora.yaml`
+
+---
+
+## How to run a single config
+
+### Python launcher
+
+Example: Qwen3.5-4B + BoolQ + full tuning
+
+```bash
+python scripts/train_short_ppo.py \
+  --config configs/matrix/qwen35_4b_boolq_full.yaml
+```
+
+Example: Qwen3.5-9B + CommonsenseQA + BVoU+LoRA
+
+```bash
+python scripts/train_short_ppo.py \
+  --config configs/matrix/qwen35_9b_commonsenseqa_bvou_lora.yaml
+```
+
+Example: DeepSeek-R1-0528-Qwen3-8B + ARC-Challenge + LoRA
+
+```bash
+python scripts/train_short_ppo.py \
+  --config configs/matrix/deepseek_r1_0528_qwen3_8b_arc_challenge_lora.yaml
+```
+
+### Accelerate + DeepSpeed launcher
+
+Example with ZeRO-2:
+
+```bash
+accelerate launch --config_file accelerate/zero2.yaml \
+  scripts/train_short_ppo.py \
+  --config configs/matrix/qwen35_4b_boolq_full.yaml
+```
+
+Example with ZeRO-3:
+
+```bash
+accelerate launch --config_file accelerate/zero3.yaml \
+  scripts/train_short_ppo.py \
+  --config configs/matrix/qwen35_9b_commonsenseqa_bvou.yaml
+```
+
+---
+
+## Recommended launch choices
+
+- `Qwen/Qwen3.5-4B`: start with `accelerate/zero2.yaml`
+- `Qwen/Qwen3.5-9B`: prefer `accelerate/zero2.yaml`, move to `zero3` if needed
+- `deepseek-ai/DeepSeek-R1-0528-Qwen3-8B`: start with `accelerate/zero2.yaml`
+
+If you are debugging or checking that the code path works, start with **ZeRO-1**.
+
+---
+
+## Baseline and step=0 evaluation
+
+Before any training updates, the trainer automatically:
+
+1. saves an untrained checkpoint at:
+
+```text
+<output_dir>/init/
+```
+
+2. runs baseline evaluation and records it as:
+
+- `phase = baseline_eval`
+- `step = 0`
+
+Files written include:
+
+- `<output_dir>/baseline_metrics.json`
+- `<output_dir>/metrics.jsonl`
+
+---
+
+## Rollout saving
+
+The repo can save both training and evaluation rollouts.
+
+Config section:
+
+```yaml
+rollouts:
+  save_train_rollouts: true
+  save_eval_rollouts: true
+  max_train_rollouts_per_save: 0
+  max_eval_rollouts_per_save: 0
+```
+
+Recommended for short-output tasks:
+
+- save all eval rollouts
+- save all train rollouts if disk is acceptable
+
+Train rollouts are written to:
+
+```text
+<output_dir>/rollouts/train/
+```
+
+Eval rollouts are written to:
+
+```text
+<output_dir>/rollouts/eval/<task>/<split>/
+```
+
+---
+
+## How to evaluate a trained checkpoint
+
+Example:
 
 ```bash
 python scripts/eval_short_tasks.py \
-  --checkpoint outputs/qwen35_4b_boolq/latest \
+  --checkpoint outputs/qwen35_4b_boolq_full/latest \
   --model-id Qwen/Qwen3.5-4B \
   --task boolq \
   --split validation
 ```
 
+Save eval rollouts too:
+
+```bash
+python scripts/eval_short_tasks.py \
+  --checkpoint outputs/qwen35_4b_boolq_full/latest \
+  --model-id Qwen/Qwen3.5-4B \
+  --task boolq \
+  --split validation \
+  --save-rollouts
+```
+
 ---
 
-## Run all four modes automatically
+## How to run four modes automatically for one model/task pair
 
-The easiest way to compare methods is:
+If you want one base config to generate and run all four modes automatically, use:
 
 ```bash
 python scripts/run_four_modes.py \
   --config configs/qwen35_4b_boolq.yaml
 ```
 
-This generates derived configs and runs:
-
-- `full`
-- `lora`
-- `bvou`
-- `bvou_lora`
-
-By default it writes results under a directory like:
-
-```text
-outputs/<base_config_name>_four_modes/
-```
-
-### Dry run
-
-```bash
-python scripts/run_four_modes.py \
-  --config configs/qwen35_4b_boolq.yaml \
-  --dry-run
-```
-
-### Use Accelerate launcher
+With Accelerate:
 
 ```bash
 python scripts/run_four_modes.py \
   --config configs/qwen35_9b_commonsenseqa.yaml \
   --launcher accelerate \
-  --accelerate-config path/to/accelerate_config.yaml
+  --accelerate-config accelerate/zero2.yaml
 ```
+
+But if you want **fully explicit experiment bookkeeping**, prefer the `configs/matrix/*.yaml` files instead.
 
 ---
 
-## Evaluate all four modes automatically
+## How to evaluate four modes automatically
 
 ```bash
 python scripts/eval_four_modes.py \
   --run-root outputs/qwen35_4b_boolq_four_modes
 ```
 
-You can also override the task and split:
-
-```bash
-python scripts/eval_four_modes.py \
-  --run-root outputs/qwen35_9b_commonsenseqa_four_modes \
-  --task commonsenseqa \
-  --split validation
-```
-
 ---
 
-## Baseline saving and evaluation
+## Output structure
 
-Before training starts, the trainer now does two things automatically:
-
-1. saves an **untrained checkpoint** to:
+A single explicit config run writes to its own output directory, for example:
 
 ```text
-<output_dir>/init/
+outputs/qwen35_4b_boolq_full/
 ```
 
-2. runs **baseline evaluation** before any updates and writes:
+Inside you will typically see:
 
 ```text
-<output_dir>/baseline_metrics.json
+init/
+latest/
+step-100/
+step-200/
+...
+baseline_metrics.json
+config.json
+metrics.jsonl
+rollouts/
 ```
-
-The same baseline rows are also written into `metrics.jsonl` with:
-
-- `phase = "baseline_eval"`
-- `is_baseline = true`
-- `step = -1`
-
-This means every run directory contains both:
-
-- a true pre-training checkpoint
-- pre-training accuracy numbers
 
 ---
 
-## Output files per run
-
-A typical run directory contains:
+## Repo layout
 
 ```text
-outputs/<run_name>/
-├── config.json
-├── metrics.jsonl
-├── baseline_metrics.json
-├── init/
-├── latest/
-└── step-*/
+beippo/
+├── accelerate/
+│   ├── zero1.yaml
+│   ├── zero2.yaml
+│   └── zero3.yaml
+├── configs/
+│   ├── qwen35_4b_boolq.yaml
+│   ├── qwen35_9b_commonsenseqa.yaml
+│   ├── deepseek_r1_0528_qwen3_8b_arc.yaml
+│   └── matrix/
+│       └── 36 explicit model-task-mode YAMLs
+├── deepspeed/
+│   ├── zero1.json
+│   ├── zero2.json
+│   └── zero3.json
+├── scripts/
+│   ├── train_short_ppo.py
+│   ├── eval_short_tasks.py
+│   ├── run_four_modes.py
+│   ├── eval_four_modes.py
+│   └── make_results_table.py
+├── src/
+│   └── beippo/
+└── tests/
 ```
-
-### What is in `metrics.jsonl`
-
-It includes both training-time logs and eval logs, including:
-
-- `reward_mean`
-- `policy_loss`
-- `value_loss`
-- `approx_kl`
-- `peak_memory_gb`
-- `trainable_params`
-- `selected_blocks`
-- baseline eval rows
-- training eval rows
 
 ---
 
-## Summarize results
+## Practical recommendation
 
-You can summarize one or more run directories with:
+For the cleanest comparison, run the explicit matrix files directly. Each matrix YAML is now self-contained with explicit sample counts, train steps, batch sizing, and sequence-length budget.
+
+Good first three commands:
 
 ```bash
-python scripts/make_results_table.py outputs/qwen35_4b_boolq
+accelerate launch --config_file accelerate/zero2.yaml \
+  scripts/train_short_ppo.py \
+  --config configs/matrix/qwen35_4b_boolq_full.yaml
+
+accelerate launch --config_file accelerate/zero2.yaml \
+  scripts/train_short_ppo.py \
+  --config configs/matrix/qwen35_4b_boolq_lora.yaml
+
+accelerate launch --config_file accelerate/zero2.yaml \
+  scripts/train_short_ppo.py \
+  --config configs/matrix/qwen35_4b_boolq_bvou_lora.yaml
 ```
 
-or multiple runs:
-
-```bash
-python scripts/make_results_table.py \
-  outputs/qwen35_4b_boolq_four_modes/full \
-  outputs/qwen35_4b_boolq_four_modes/lora \
-  outputs/qwen35_4b_boolq_four_modes/bvou \
-  outputs/qwen35_4b_boolq_four_modes/bvou_lora
-```
-
-The summary table includes:
-
-- baseline accuracy columns like `baseline_boolq_validation`
-- latest eval accuracy columns like `boolq_validation`
-- `peak_memory_gb`
-- `reward_mean_last`
-
----
-
-## Recommended experiment order
-
-A practical sequence is:
-
-1. `Qwen3.5-4B` on `boolq`
-2. `Qwen3.5-9B` on `commonsenseqa`
-3. `DeepSeek-R1-0528-Qwen3-8B` on `arc_challenge`
-
-For each, compare:
-
-- `full`
-- `lora`
-- `bvou`
-- `bvou_lora`
-
-Main things to report:
-
-- baseline exact match
-- final exact match
-- mean reward during training
-- peak GPU memory
-- trainable parameter count
-
----
-
-## Important limitations
-
-- `gate_grad` is still a **proxy** for block utility, not an exact update-value oracle.
-- The training loop is intentionally lightweight and should be treated as a **research scaffold**.
-- The default implementation rebuilds the optimizer in the update step, which is simple and practical for comparison, but not the final word on training efficiency.
-- This repo is designed for decoder-only Hugging Face chat models with recognizable block structure; other architectures may need small adjustments.
-
----
-
-## License
-
-MIT
-
-
-## Rollout logging
-
-You can optionally save train and evaluation rollouts with:
-
-```yaml
-rollouts:
-  save_train_rollouts: true
-  save_eval_rollouts: true
-  max_train_rollouts_per_save: 8
-  max_eval_rollouts_per_save: 64
-```
-
-Saved files go under `outputs/<run>/rollouts/train/` and `outputs/<run>/rollouts/eval/`.
+Then expand to the other 33 configs.

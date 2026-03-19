@@ -1,6 +1,6 @@
 train:
-  run_name: deepseek_r1_0528_qwen3_8b_arc
-  output_dir: outputs/deepseek_r1_0528_qwen3_8b_arc
+  run_name: deepseek_r1_0528_qwen3_8b_arc_challenge_bvou
+  output_dir: outputs/deepseek_r1_0528_qwen3_8b_arc_challenge_bvou
   model_name_or_path: deepseek-ai/DeepSeek-R1-0528-Qwen3-8B
   model_family: deepseek_r1_0528
   task_name: arc_challenge
@@ -9,29 +9,42 @@ train:
   - validation
   enable_thinking: false
   use_official_system_prompt: false
-  deepseek_prompt_date: 2026年3月19日，星期四
   max_train_samples: 2250
   max_eval_samples: 570
   per_device_batch_size: 1
   gradient_accumulation_steps: 16
   response_max_new_tokens: 8
   num_train_steps: 500
-  learning_rate: 1.0e-05
+  learning_rate: 1.5e-05
   full_tune: false
+  gradient_checkpointing: true
+  save_every: 100
+  eval_every: 100
+  report_to: none
+  deepseek_prompt_date: 2026年3月19日，星期四
   prompt_max_length: 768
   weight_decay: 0.01
   warmup_ratio: 0.03
   bf16: true
-  save_every: 100
-  eval_every: 100
-  gradient_checkpointing: true
-  report_to: none
 lora:
   enabled: false
+  r: 16
+  alpha: 32
+  dropout: 0.05
+  target_modules:
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
 selector:
-  enabled: false
+  enabled: true
+  scorer: gate_grad
   top_k: 8
+  select_every: 1
   search_upper_half_only: true
+  active_only_optimizer_state: false
 rollouts:
   save_train_rollouts: false
   save_eval_rollouts: false
+  max_train_rollouts_per_save: 0
+  max_eval_rollouts_per_save: 0
