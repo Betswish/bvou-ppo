@@ -63,7 +63,7 @@ def evaluate_run(run_dir: Path, checkpoint_tag: str | None, task_override: str |
         use_official_system_prompt=train_cfg.get("use_official_system_prompt", False),
         deepseek_prompt_date=train_cfg.get("deepseek_prompt_date", "2026年3月19日，星期四"),
     )
-    result = run_task_eval(
+    result, _ = run_task_eval(
         model,
         tokenizer,
         task_name,

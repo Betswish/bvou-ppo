@@ -15,6 +15,7 @@ from transformers import AutoModelForCausalLM
 from beippo.config import ExperimentConfig
 from beippo.data import TaskExample, load_task_examples
 from beippo.eval import run_task_eval
+from beippo.rollouts import save_eval_rollouts, save_train_rollouts
 from beippo.modeling import count_trainable_parameters, extract_block_index, freeze_all_parameters, maybe_enable_gradient_checkpointing
 from beippo.models.policy_value_model import PolicyWithValueHead, apply_lora, build_tokenizer
 from beippo.ppo import RolloutBatch, build_response_mask, compute_returns_and_advantages, ppo_loss, shift_logprobs
@@ -155,7 +156,7 @@ def generate_rollout_batch(accelerator, model, reference_model, tokenizer, batch
         advantages=advantages.detach(),
         prompt_lengths=prompt_lengths.detach(),
     )
-    return rollout
+    return rollout, responses
 
 
 def run_evals(accelerator, model, tokenizer, cfg: ExperimentConfig, logger: JsonlLogger, step: int, phase: str, write_summary_to: Path | None = None) -> list[dict]:
@@ -174,7 +175,7 @@ def run_evals(accelerator, model, tokenizer, cfg: ExperimentConfig, logger: Json
             use_official_system_prompt=cfg.train.use_official_system_prompt,
             deepseek_prompt_date=cfg.train.deepseek_prompt_date,
         )
-        result = run_task_eval(
+        result, rollout_records = run_task_eval(
             accelerator.unwrap_model(model),
             tokenizer,
             cfg.train.task_name,
@@ -182,7 +183,19 @@ def run_evals(accelerator, model, tokenizer, cfg: ExperimentConfig, logger: Json
             eval_examples,
             batch_size=cfg.train.per_device_batch_size,
             max_new_tokens=cfg.train.response_max_new_tokens,
+            collect_rollouts=cfg.rollouts.save_eval_rollouts,
         )
+        if cfg.rollouts.max_eval_rollouts_per_save > 0:
+            rollout_records = rollout_records[: cfg.rollouts.max_eval_rollouts_per_save]
+        if cfg.rollouts.save_eval_rollouts:
+            save_eval_rollouts(
+                output_dir=cfg.train.output_dir,
+                step=step,
+                phase=phase,
+                task_name=result.task_name,
+                split=result.split,
+                records=rollout_records,
+            )
         payload = {
             "step": step,
             "phase": phase,
@@ -191,6 +204,7 @@ def run_evals(accelerator, model, tokenizer, cfg: ExperimentConfig, logger: Json
             "split": result.split,
             "exact_match": result.exact_match,
             "samples": result.samples,
+            "saved_eval_rollouts": bool(cfg.rollouts.save_eval_rollouts),
         }
         logger.log(payload)
         results_payloads.append(payload)
@@ -263,7 +277,7 @@ def run_training(cfg: ExperimentConfig) -> None:
         tokenizer=tokenizer,
         cfg=cfg,
         logger=logger,
-        step=-1,
+        step=0,
         phase="baseline_eval",
         write_summary_to=output_dir / "baseline_metrics.json",
     )
@@ -278,7 +292,7 @@ def run_training(cfg: ExperimentConfig) -> None:
         for group in optimizer.param_groups:
             group["lr"] = lr
 
-        rollout = generate_rollout_batch(accelerator, model, reference_model, tokenizer, batch, cfg)
+        rollout, responses = generate_rollout_batch(accelerator, model, reference_model, tokenizer, batch, cfg)
 
         selected_blocks: list[int] = []
         if selector:
@@ -309,7 +323,7 @@ def run_training(cfg: ExperimentConfig) -> None:
 
         trainable, total = count_trainable_parameters(accelerator.unwrap_model(model))
         metrics = {
-            "step": step,
+            "step": step + 1,
             "task": cfg.train.task_name,
             "reward_mean": float(rollout.rewards.mean().item()),
             "policy_loss": float(loss_out.policy_loss.item()),
@@ -320,6 +334,26 @@ def run_training(cfg: ExperimentConfig) -> None:
             "total_params": total,
             "selected_blocks": selected_blocks,
         }
+        if accelerator.is_main_process and cfg.rollouts.save_train_rollouts:
+            limited_batch = batch
+            limited_responses = responses
+            limited_rewards = rollout.rewards.detach().float().cpu().tolist()
+            if cfg.rollouts.max_train_rollouts_per_save > 0:
+                k = cfg.rollouts.max_train_rollouts_per_save
+                limited_batch = batch[:k]
+                limited_responses = responses[:k]
+                limited_rewards = limited_rewards[:k]
+            train_rollout_path = save_train_rollouts(
+                output_dir=cfg.train.output_dir,
+                step=step + 1,
+                batch=limited_batch,
+                responses=limited_responses,
+                rewards=limited_rewards,
+                selected_blocks=selected_blocks,
+                model_name_or_path=cfg.train.model_name_or_path,
+                task_name=cfg.train.task_name,
+            )
+            metrics['train_rollout_file'] = str(train_rollout_path)
         if accelerator.is_main_process:
             logger.log(metrics)
         progress.set_postfix(reward=f"{metrics['reward_mean']:.3f}", mem=f"{metrics['peak_memory_gb']:.1f}G")
@@ -332,7 +366,7 @@ def run_training(cfg: ExperimentConfig) -> None:
                 tokenizer=tokenizer,
                 cfg=cfg,
                 logger=logger,
-                step=step,
+                step=step + 1,
                 phase="train_eval",
             )
             accelerator.wait_for_everyone()

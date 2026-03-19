@@ -67,11 +67,20 @@ class TrainConfig:
 
 
 @dataclass
+class RolloutSaveConfig:
+    save_train_rollouts: bool = False
+    save_eval_rollouts: bool = False
+    max_train_rollouts_per_save: int = 0
+    max_eval_rollouts_per_save: int = 0
+
+
+@dataclass
 class ExperimentConfig:
     train: TrainConfig = field(default_factory=TrainConfig)
     ppo: PPOConfig = field(default_factory=PPOConfig)
     lora: LoRAConfig = field(default_factory=LoRAConfig)
     selector: SelectorConfig = field(default_factory=SelectorConfig)
+    rollouts: RolloutSaveConfig = field(default_factory=RolloutSaveConfig)
 
 
 def _deep_update(base: dict[str, Any], updates: dict[str, Any]) -> dict[str, Any]:
@@ -92,6 +101,7 @@ def load_config(path: str | Path) -> ExperimentConfig:
         "ppo": PPOConfig().__dict__,
         "lora": LoRAConfig().__dict__,
         "selector": SelectorConfig().__dict__,
+        "rollouts": RolloutSaveConfig().__dict__,
     }
     merged = _deep_update(base, raw)
     return ExperimentConfig(
@@ -99,4 +109,5 @@ def load_config(path: str | Path) -> ExperimentConfig:
         ppo=PPOConfig(**merged["ppo"]),
         lora=LoRAConfig(**merged["lora"]),
         selector=SelectorConfig(**merged["selector"]),
+        rollouts=RolloutSaveConfig(**merged["rollouts"]),
     )

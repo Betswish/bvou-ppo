@@ -22,7 +22,9 @@ class PolicyWithValueHead(nn.Module):
             torch_dtype=torch.bfloat16 if torch.cuda.is_available() else None,
         )
         hidden_size = self.pretrained_model.config.hidden_size
+        backbone_param = next(self.pretrained_model.parameters())
         self.value_head = nn.Linear(hidden_size, 1, bias=False)
+        self.value_head.to(device=backbone_param.device, dtype=backbone_param.dtype)
         nn.init.normal_(self.value_head.weight, mean=0.0, std=value_head_init_std)
 
     def forward(self, *args, **kwargs) -> PolicyValueOutput:
@@ -31,6 +33,8 @@ class PolicyWithValueHead(nn.Module):
         kwargs.setdefault("use_cache", False)
         outputs = self.pretrained_model(*args, **kwargs)
         last_hidden = outputs.hidden_states[-1]
+        if last_hidden.dtype != self.value_head.weight.dtype:
+            last_hidden = last_hidden.to(self.value_head.weight.dtype)
         values = self.value_head(last_hidden).squeeze(-1)
         return PolicyValueOutput(logits=outputs.logits, values=values)
 
@@ -47,6 +51,7 @@ def build_tokenizer(model_name_or_path: str):
     tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, use_fast=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"
     return tokenizer
 
 

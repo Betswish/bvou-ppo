@@ -10,7 +10,6 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 import argparse
-from pathlib import Path
 
 import torch
 from transformers import AutoTokenizer
@@ -18,6 +17,7 @@ from transformers import AutoTokenizer
 from beippo.data import load_task_examples
 from beippo.eval import run_task_eval
 from beippo.models.policy_value_model import PolicyWithValueHead
+from beippo.rollouts import save_eval_rollouts
 
 
 if __name__ == "__main__":
@@ -30,12 +30,16 @@ if __name__ == "__main__":
     parser.add_argument("--no-official-system-prompt", action="store_true")
     parser.add_argument("--deepseek-prompt-date", type=str, default="2026年3月19日，星期四")
     parser.add_argument("--model-id", type=str, default=None, help="Original Hub model id or registry alias for prompt-family inference.")
+    parser.add_argument("--save-rollouts", action="store_true")
+    parser.add_argument("--rollout-output", type=str, default=None)
     args = parser.parse_args()
 
     ckpt = Path(args.checkpoint)
     tokenizer = AutoTokenizer.from_pretrained(str(ckpt), use_fast=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"
+
     model = PolicyWithValueHead(str(ckpt))
     value_head_path = ckpt / "value_head.pt"
     if value_head_path.exists():
@@ -54,5 +58,16 @@ if __name__ == "__main__":
         use_official_system_prompt=not args.no_official_system_prompt,
         deepseek_prompt_date=args.deepseek_prompt_date,
     )
-    result = run_task_eval(model, tokenizer, args.task, args.split, examples)
+    result, rollout_records = run_task_eval(
+        model,
+        tokenizer,
+        args.task,
+        args.split,
+        examples,
+        collect_rollouts=args.save_rollouts,
+    )
+    if args.save_rollouts:
+        out_root = args.rollout_output or str(ckpt)
+        path = save_eval_rollouts(out_root, step=0, phase="manual_eval", task_name=args.task, split=args.split, records=rollout_records)
+        print({"saved_rollouts": str(path)})
     print({"task": result.task_name, "split": result.split, "samples": result.samples, "exact_match": result.exact_match})

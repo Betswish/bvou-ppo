@@ -1,4 +1,4 @@
-# beippo
+# bvou-ppo
 
 A research scaffold for testing **block-selective PPO updates** on **short-output classification-style tasks**.
 
@@ -104,7 +104,7 @@ train:
 ## Repo layout
 
 ```text
-beippo/
+bvou-ppo/
 ├── configs/
 │   ├── qwen35_4b_boolq.yaml
 │   ├── qwen35_9b_commonsenseqa.yaml
@@ -115,7 +115,7 @@ beippo/
 │   ├── run_four_modes.py
 │   ├── eval_four_modes.py
 │   └── make_results_table.py
-├── src/beippo/
+├── src/bvou_ppo/
 │   ├── config.py
 │   ├── data.py
 │   ├── eval.py
@@ -369,3 +369,18 @@ Main things to report:
 ## License
 
 MIT
+
+
+## Rollout logging
+
+You can optionally save train and evaluation rollouts with:
+
+```yaml
+rollouts:
+  save_train_rollouts: true
+  save_eval_rollouts: true
+  max_train_rollouts_per_save: 8
+  max_eval_rollouts_per_save: 64
+```
+
+Saved files go under `outputs/<run>/rollouts/train/` and `outputs/<run>/rollouts/eval/`.
