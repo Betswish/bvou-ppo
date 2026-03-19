@@ -389,7 +389,8 @@ def run_evals(accelerator, model, tokenizer, cfg: ExperimentConfig, logger: Json
 
 
 def run_training(cfg: ExperimentConfig) -> None:
-    accelerator = Accelerator(gradient_accumulation_steps=cfg.train.gradient_accumulation_steps)
+    effective_grad_accum = 1 if cfg.selector.enabled else cfg.train.gradient_accumulation_steps
+    accelerator = Accelerator(gradient_accumulation_steps=effective_grad_accum)
     output_dir = Path(cfg.train.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     logger = JsonlLogger(output_dir)
@@ -454,12 +455,16 @@ def run_training(cfg: ExperimentConfig) -> None:
     )
     accelerator.wait_for_everyone()
 
-    progress = tqdm(range(cfg.train.num_train_steps), disable=not accelerator.is_local_main_process)
+    progress = tqdm(total=cfg.train.num_train_steps, disable=not accelerator.is_local_main_process)
     step_iter = cycle(train_loader)
-    for step in progress:
+    update_step = 0
+    micro_step = 0
+
+    while update_step < cfg.train.num_train_steps:
         reset_peak_memory_stats()
         batch = next(step_iter)
-        lr = _current_lr(step, cfg.train.num_train_steps, cfg.train.learning_rate, cfg.train.warmup_ratio)
+        micro_step += 1
+        lr = _current_lr(update_step, cfg.train.num_train_steps, cfg.train.learning_rate, cfg.train.warmup_ratio)
         for group in optimizer.param_groups:
             group["lr"] = lr
 
@@ -507,48 +512,69 @@ def run_training(cfg: ExperimentConfig) -> None:
             cfg.lora.enabled,
         )
 
-        outputs = model(input_ids=rollout.input_ids, attention_mask=rollout.attention_mask)
-        loss_out = ppo_loss(outputs.logits, outputs.values, rollout, cfg.ppo.clip_range, cfg.ppo.value_coef, cfg.ppo.kl_coef)
-        safe_zero_grad(optimizer)
-        accelerator.backward(loss_out.loss)
+        monitored_grad_l2 = 0.0
+        monitored_grad_tensors = 0
+        monitored_probe_numel = 0
+        monitored_probe_delta_l2 = 0.0
+        value_head_grad_l2 = 0.0
+        value_head_grad_tensors = 0
+        value_head_probe_numel = 0
+        value_head_probe_delta_l2 = 0.0
+        optimizer_step_applied = False
+        loss_out = None
 
-        unwrapped = accelerator.unwrap_model(model)
-        monitored_named_params = list(_iter_monitored_named_params(
-            unwrapped,
-            selected_blocks if selector else None,
-            lora_enabled=cfg.lora.enabled,
-            include_value_head=False,
-        ))
-        value_head_named_params = list(_iter_monitored_named_params(
-            unwrapped,
-            selected_blocks if selector else None,
-            lora_enabled=cfg.lora.enabled,
-            include_value_head=True,
-        ))
-        monitored_grad_l2, monitored_grad_tensors = _grad_l2_and_count(monitored_named_params)
-        value_head_grad_l2, value_head_grad_tensors = _grad_l2_and_count(
-            [(n, p) for n, p in value_head_named_params if n.startswith("value_head")]
-        )
-        monitored_probe_before, monitored_probe_numel = _capture_param_probe(monitored_named_params)
-        value_head_probe_before, value_head_probe_numel = _capture_param_probe(
-            [(n, p) for n, p in value_head_named_params if n.startswith("value_head")]
-        )
+        with accelerator.accumulate(model):
+            outputs = model(input_ids=rollout.input_ids, attention_mask=rollout.attention_mask)
+            loss_out = ppo_loss(outputs.logits, outputs.values, rollout, cfg.ppo.clip_range, cfg.ppo.value_coef, cfg.ppo.kl_coef)
+            safe_zero_grad(optimizer)
+            accelerator.backward(loss_out.loss)
 
-        accelerator.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], cfg.ppo.max_grad_norm)
-        optimizer.step()
+            unwrapped = accelerator.unwrap_model(model)
+            monitored_named_params = list(_iter_monitored_named_params(
+                unwrapped,
+                selected_blocks if selector else None,
+                lora_enabled=cfg.lora.enabled,
+                include_value_head=False,
+            ))
+            value_head_named_params = [
+                (n, p) for n, p in _iter_monitored_named_params(
+                    unwrapped,
+                    selected_blocks if selector else None,
+                    lora_enabled=cfg.lora.enabled,
+                    include_value_head=True,
+                ) if n.startswith("value_head")
+            ]
 
-        monitored_probe_after, _ = _capture_param_probe(monitored_named_params)
-        value_head_probe_after, _ = _capture_param_probe(
-            [(n, p) for n, p in value_head_named_params if n.startswith("value_head")]
-        )
-        monitored_probe_delta_l2 = _probe_delta_l2(monitored_probe_before, monitored_probe_after)
-        value_head_probe_delta_l2 = _probe_delta_l2(value_head_probe_before, value_head_probe_after)
+            monitored_grad_l2, monitored_grad_tensors = _grad_l2_and_count(monitored_named_params)
+            value_head_grad_l2, value_head_grad_tensors = _grad_l2_and_count(value_head_named_params)
 
-        safe_zero_grad(model)
+            if accelerator.sync_gradients:
+                monitored_probe_before, monitored_probe_numel = _capture_param_probe(monitored_named_params)
+                value_head_probe_before, value_head_probe_numel = _capture_param_probe(value_head_named_params)
+                accelerator.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], cfg.ppo.max_grad_norm)
+            else:
+                monitored_probe_before, value_head_probe_before = {}, {}
 
-        trainable, total = count_trainable_parameters(unwrapped)
+            optimizer.step()
+            safe_zero_grad(model)
+
+            optimizer_step_applied = bool(accelerator.sync_gradients)
+            if optimizer_step_applied:
+                monitored_probe_after, _ = _capture_param_probe(monitored_named_params)
+                value_head_probe_after, _ = _capture_param_probe(value_head_named_params)
+                monitored_probe_delta_l2 = _probe_delta_l2(monitored_probe_before, monitored_probe_after)
+                value_head_probe_delta_l2 = _probe_delta_l2(value_head_probe_before, value_head_probe_after)
+
+        if not optimizer_step_applied:
+            continue
+
+        update_step += 1
+        trainable, total = count_trainable_parameters(accelerator.unwrap_model(model))
         metrics = {
-            "step": step + 1,
+            "step": update_step,
+            "micro_step": micro_step,
+            "optimizer_step_applied": optimizer_step_applied,
+            "effective_gradient_accumulation_steps": effective_grad_accum,
             "task": cfg.train.task_name,
             "reward_mean": float(rollout.rewards.mean().item()),
             "policy_loss": float(loss_out.policy_loss.item()),
@@ -581,7 +607,7 @@ def run_training(cfg: ExperimentConfig) -> None:
                 limited_rewards = limited_rewards[:k]
             train_rollout_path = save_train_rollouts(
                 output_dir=cfg.train.output_dir,
-                step=step + 1,
+                step=update_step,
                 batch=limited_batch,
                 responses=limited_responses,
                 rewards=limited_rewards,
@@ -589,12 +615,13 @@ def run_training(cfg: ExperimentConfig) -> None:
                 model_name_or_path=cfg.train.model_name_or_path,
                 task_name=cfg.train.task_name,
             )
-            metrics['train_rollout_file'] = str(train_rollout_path)
+            metrics["train_rollout_file"] = str(train_rollout_path)
         if accelerator.is_main_process:
             logger.log(metrics)
+        progress.update(1)
         progress.set_postfix(reward=f"{metrics['reward_mean']:.3f}", mem=f"{metrics['peak_memory_gb']:.1f}G")
 
-        if (step + 1) % cfg.train.eval_every == 0:
+        if update_step % cfg.train.eval_every == 0:
             accelerator.wait_for_everyone()
             run_evals(
                 accelerator=accelerator,
@@ -602,14 +629,14 @@ def run_training(cfg: ExperimentConfig) -> None:
                 tokenizer=tokenizer,
                 cfg=cfg,
                 logger=logger,
-                step=step + 1,
+                step=update_step,
                 phase="train_eval",
             )
             accelerator.wait_for_everyone()
 
-        if (step + 1) % cfg.train.save_every == 0:
+        if update_step % cfg.train.save_every == 0:
             accelerator.wait_for_everyone()
-            save_checkpoint(accelerator, model, tokenizer, output_dir, step=step + 1)
+            save_checkpoint(accelerator, model, tokenizer, output_dir, step=update_step)
             accelerator.wait_for_everyone()
 
     accelerator.wait_for_everyone()
