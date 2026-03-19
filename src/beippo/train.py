@@ -94,6 +94,74 @@ def safe_zero_grad(obj) -> None:
     except TypeError:
         zero_grad()
 
+
+def _iter_monitored_named_params(model, selected_blocks, lora_enabled: bool, include_value_head: bool = False):
+    selected = set(selected_blocks or [])
+    using_selector = selected_blocks is not None
+    for name, param in model.named_parameters():
+        if name.startswith("value_head"):
+            if include_value_head:
+                yield name, param
+            continue
+        if not param.requires_grad:
+            continue
+        if not using_selector:
+            yield name, param
+            continue
+        block_idx = extract_block_index(name)
+        if block_idx is None or block_idx not in selected:
+            continue
+        if lora_enabled:
+            if _is_lora_param(name):
+                yield name, param
+        else:
+            if not _is_lora_param(name):
+                yield name, param
+
+
+def _grad_l2_and_count(named_params) -> tuple[float, int]:
+    total = None
+    count = 0
+    for _name, param in named_params:
+        grad = getattr(param, "grad", None)
+        if grad is None:
+            continue
+        term = grad.detach().float().pow(2).sum()
+        total = term if total is None else total + term.to(total.device)
+        count += 1
+    if total is None:
+        return 0.0, 0
+    return float(total.sqrt().item()), count
+
+
+def _capture_param_probe(named_params, max_per_tensor: int = 16):
+    probe = {}
+    total_numel = 0
+    for name, param in named_params:
+        flat = param.detach().view(-1)
+        if flat.numel() == 0:
+            continue
+        k = min(max_per_tensor, flat.numel())
+        if k == flat.numel():
+            idx = torch.arange(k, device=flat.device)
+        else:
+            idx = torch.linspace(0, flat.numel() - 1, steps=k, device=flat.device).long()
+        vals = flat.index_select(0, idx).float().cpu()
+        probe[name] = vals
+        total_numel += int(k)
+    return probe, total_numel
+
+
+def _probe_delta_l2(before_probe: dict[str, torch.Tensor], after_probe: dict[str, torch.Tensor]) -> float:
+    total = 0.0
+    for name, before in before_probe.items():
+        after = after_probe.get(name)
+        if after is None:
+            continue
+        total += float((after - before).pow(2).sum().item())
+    return total ** 0.5
+
+
 def build_optimizer(model, lr: float, weight_decay: float) -> AdamW:
     # Keep all parameters in the optimizer so selector-based modes can toggle
     # requires_grad dynamically without rebuilding the optimizer under DeepSpeed.
@@ -436,11 +504,42 @@ def run_training(cfg: ExperimentConfig) -> None:
         loss_out = ppo_loss(outputs.logits, outputs.values, rollout, cfg.ppo.clip_range, cfg.ppo.value_coef, cfg.ppo.kl_coef)
         safe_zero_grad(optimizer)
         accelerator.backward(loss_out.loss)
+
+        unwrapped = accelerator.unwrap_model(model)
+        monitored_named_params = list(_iter_monitored_named_params(
+            unwrapped,
+            selected_blocks if selector else None,
+            lora_enabled=cfg.lora.enabled,
+            include_value_head=False,
+        ))
+        value_head_named_params = list(_iter_monitored_named_params(
+            unwrapped,
+            selected_blocks if selector else None,
+            lora_enabled=cfg.lora.enabled,
+            include_value_head=True,
+        ))
+        monitored_grad_l2, monitored_grad_tensors = _grad_l2_and_count(monitored_named_params)
+        value_head_grad_l2, value_head_grad_tensors = _grad_l2_and_count(
+            [(n, p) for n, p in value_head_named_params if n.startswith("value_head")]
+        )
+        monitored_probe_before, monitored_probe_numel = _capture_param_probe(monitored_named_params)
+        value_head_probe_before, value_head_probe_numel = _capture_param_probe(
+            [(n, p) for n, p in value_head_named_params if n.startswith("value_head")]
+        )
+
         accelerator.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], cfg.ppo.max_grad_norm)
         optimizer.step()
+
+        monitored_probe_after, _ = _capture_param_probe(monitored_named_params)
+        value_head_probe_after, _ = _capture_param_probe(
+            [(n, p) for n, p in value_head_named_params if n.startswith("value_head")]
+        )
+        monitored_probe_delta_l2 = _probe_delta_l2(monitored_probe_before, monitored_probe_after)
+        value_head_probe_delta_l2 = _probe_delta_l2(value_head_probe_before, value_head_probe_after)
+
         safe_zero_grad(model)
 
-        trainable, total = count_trainable_parameters(accelerator.unwrap_model(model))
+        trainable, total = count_trainable_parameters(unwrapped)
         metrics = {
             "step": step + 1,
             "task": cfg.train.task_name,
@@ -454,6 +553,15 @@ def run_training(cfg: ExperimentConfig) -> None:
             "selected_blocks": selected_blocks,
             "selector_scorer": cfg.selector.scorer if selector else None,
             "selector_scores": selector_scores,
+            "monitored_param_scope": "selected_blocks" if selector else "trainable",
+            "monitored_param_grad_l2": monitored_grad_l2,
+            "monitored_param_grad_tensors": monitored_grad_tensors,
+            "monitored_param_probe_numel": monitored_probe_numel,
+            "monitored_param_probe_delta_l2": monitored_probe_delta_l2,
+            "value_head_grad_l2": value_head_grad_l2,
+            "value_head_grad_tensors": value_head_grad_tensors,
+            "value_head_probe_numel": value_head_probe_numel,
+            "value_head_probe_delta_l2": value_head_probe_delta_l2,
         }
         if accelerator.is_main_process and cfg.rollouts.save_train_rollouts:
             limited_batch = batch
