@@ -135,20 +135,27 @@ def _grad_l2_and_count(named_params) -> tuple[float, int]:
 
 
 def _capture_param_probe(named_params, max_per_tensor: int = 16):
+    """Capture a tiny, safe parameter probe for logging.
+
+    Under ZeRO/multi-GPU some parameters may be sharded or wrapped in ways that
+    make fancy indexing on-device brittle. For logging we only need a stable
+    signal that parameters changed, so we sample a small strided prefix view and
+    then move it to CPU.
+    """
     probe = {}
     total_numel = 0
     for name, param in named_params:
-        flat = param.detach().view(-1)
-        if flat.numel() == 0:
+        flat = param.detach().reshape(-1)
+        n = int(flat.numel())
+        if n == 0:
             continue
-        k = min(max_per_tensor, flat.numel())
-        if k == flat.numel():
-            idx = torch.arange(k, device=flat.device)
-        else:
-            idx = torch.linspace(0, flat.numel() - 1, steps=k, device=flat.device).long()
-        vals = flat.index_select(0, idx).float().cpu()
+        k = min(max_per_tensor, n)
+        if k <= 0:
+            continue
+        step = max(n // k, 1)
+        vals = flat[::step][:k].float().cpu().clone()
         probe[name] = vals
-        total_numel += int(k)
+        total_numel += int(vals.numel())
     return probe, total_numel
 
 
