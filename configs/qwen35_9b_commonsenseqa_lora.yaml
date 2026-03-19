@@ -39,9 +39,11 @@ selector:
   enabled: false
   scorer: adv_grad_energy
   top_k: 8
-  select_every: 1
-  search_upper_half_only: true
-  active_only_optimizer_state: false
+  select_every: 4
+  active_only_optimizer_state: true
+  candidate_last_n_layers: null
+  candidate_start_layer: null
+  candidate_end_layer: null
 rollouts:
   save_train_rollouts: true
   save_eval_rollouts: true
