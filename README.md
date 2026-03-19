@@ -431,3 +431,48 @@ accelerate launch --config_file accelerate/zero2.yaml \
 ```
 
 Then expand to the other 33 configs.
+
+
+## Proxy validity experiment
+
+The repository now includes a dedicated experiment to test whether block-level proxy scores actually track **true one-step block gains** on a fixed PPO rollout batch.
+
+The experiment computes several proxy families on the same batch:
+
+- `adv_grad_energy` — the first-order proxy derived from the actor-critic discussion,
+  \(\|\mathbb{E}[A_t 
+abla_{	heta_b} \log \pi(a_t|s_t)]\|^2\)
+- `fisher_diag_energy` — a diagonal empirical-Fisher approximation to the second-order form,
+  \(g_b^T F_b^{-1} g_b\)
+- `grad_norm` — plain PPO gradient norm per block
+- `gate_grad` — gate-based saliency on top of PPO loss
+
+For validation, the script then builds the union of top-k blocks from every proxy, performs an **actual one-step block update** on each candidate block, and measures the resulting change in the first-order scout objective. It writes per-batch JSON files plus a summary with mean Spearman and Pearson correlations.
+
+Single model / task / mode example:
+
+```bash
+python scripts/run_proxy_validity.py   --config configs/qwen35_4b_boolq_bvou.yaml   --mode bvou   --split validation   --max-samples 64   --max-batches 2   --top-k 8   --step-size 1e-4
+```
+
+Analyze a trained checkpoint instead of the base model:
+
+```bash
+python scripts/run_proxy_validity.py   --config configs/qwen35_4b_boolq_bvou.yaml   --mode bvou   --checkpoint outputs/qwen35_4b_boolq_bvou/latest   --split validation   --max-samples 64   --max-batches 2
+```
+
+Outputs are written to:
+
+```text
+outputs/<run>/proxy_validity/
+  summary.json
+  batch_0000.json
+  batch_0001.json
+  ...
+```
+
+Recommended first runs:
+
+- `qwen35_4b_boolq_bvou`
+- `qwen35_4b_boolq_bvou_lora`
+- then compare the base model against `latest/` after training.

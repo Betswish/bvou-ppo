@@ -146,11 +146,18 @@ def _select_blocks_from_adv_grad_energy(accelerator, model, rollout: RolloutBatc
         allow_unused=True,
     )
 
-    scores = torch.zeros_like(selector.controller.gates.detach(), dtype=torch.float32)
+    scores = torch.zeros_like(
+        selector.controller.gates.detach(),
+        dtype=torch.float32,
+        device=accelerator.device,
+    )
     for grad, (_, _param, block_idx) in zip(grads, named_params):
         if grad is None:
             continue
-        scores[block_idx] += grad.detach().float().pow(2).sum()
+        block_energy = grad.detach().float().pow(2).sum()
+        if block_energy.device != scores.device:
+            block_energy = block_energy.to(scores.device)
+        scores[block_idx] += block_energy
 
     scores = accelerator.reduce(scores, reduction="mean")
     result = selector.select_from_block_scores(scores)
