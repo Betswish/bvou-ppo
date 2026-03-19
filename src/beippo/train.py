@@ -6,6 +6,7 @@ from itertools import cycle
 from pathlib import Path
 
 import torch
+import torch.distributed as dist
 from accelerate import Accelerator
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset
@@ -20,15 +21,6 @@ from beippo.modeling import count_trainable_parameters, extract_block_index, fre
 from beippo.models.policy_value_model import PolicyWithValueHead, apply_lora, build_tokenizer
 from beippo.ppo import RolloutBatch, build_response_mask, compute_returns_and_advantages, ppo_loss, shift_logprobs
 from beippo.registry import resolve_model
-from beippo.block_scores import (
-    compute_adagradselect_scores,
-    compute_adv_grad_energy_scores,
-    compute_fisher_diag_energy_scores,
-    compute_gate_grad_scores,
-    compute_grad_norm_scores,
-    compute_lisa_scores,
-    compute_random_scores,
-)
 from beippo.reward import exact_match_reward
 from beippo.selector import BlockSelector
 from beippo.utils import JsonlLogger, peak_memory_gb, reset_peak_memory_stats, set_seed
@@ -53,37 +45,6 @@ def collate_examples(batch):
 def _is_lora_param(name: str) -> bool:
     return "lora_" in name
 
-def configure_prepare_trainable_parameters(model, selector_enabled: bool, full_tune: bool, lora_enabled: bool):
-    freeze_all_parameters(model)
-    for p in model.value_head.parameters():
-        p.requires_grad_(True)
-
-    if full_tune and not selector_enabled:
-        for name, param in model.named_parameters():
-            if not name.startswith("value_head"):
-                param.requires_grad_(True)
-        return
-
-    if lora_enabled and not selector_enabled:
-        for name, param in model.named_parameters():
-            if _is_lora_param(name):
-                param.requires_grad_(True)
-        return
-
-    if selector_enabled:
-        for name, param in model.named_parameters():
-            if name.startswith("value_head"):
-                continue
-            block_idx = extract_block_index(name)
-            if block_idx is None:
-                continue
-            if lora_enabled:
-                if _is_lora_param(name):
-                    param.requires_grad_(True)
-            else:
-                if not _is_lora_param(name):
-                    param.requires_grad_(True)
-                    
 
 def configure_trainable_parameters(model, selected_blocks, full_tune, lora_enabled):
     """Toggle requires_grad for the current training mode.
@@ -123,6 +84,43 @@ def configure_trainable_parameters(model, selected_blocks, full_tune, lora_enabl
         else:
             param.requires_grad_(True)
 
+
+
+
+
+def configure_prepare_trainable_parameters(model, selector_enabled: bool, full_tune: bool, lora_enabled: bool):
+    """Configure requires_grad *before* accelerator.prepare.
+
+    This is especially important for DeepSpeed/ZeRO: parameters that may be
+    updated later must already be part of the optimizer/engine parameter set at
+    prepare time.
+    """
+    freeze_all_parameters(model)
+    for p in model.value_head.parameters():
+        p.requires_grad_(True)
+
+    for name, param in model.named_parameters():
+        if name.startswith("value_head"):
+            continue
+
+        if selector_enabled:
+            block_idx = extract_block_index(name)
+            if block_idx is None:
+                continue
+            if lora_enabled:
+                if _is_lora_param(name):
+                    param.requires_grad_(True)
+            else:
+                if not _is_lora_param(name):
+                    param.requires_grad_(True)
+            continue
+
+        if full_tune:
+            param.requires_grad_(True)
+            continue
+
+        if lora_enabled and _is_lora_param(name):
+            param.requires_grad_(True)
 
 
 def safe_zero_grad(obj) -> None:
@@ -210,31 +208,70 @@ def _probe_delta_l2(before_probe: dict[str, torch.Tensor], after_probe: dict[str
 
 
 def build_optimizer(model, lr: float, weight_decay: float) -> AdamW:
-    # Keep all parameters in the optimizer so selector-based modes can toggle
-    # requires_grad dynamically without rebuilding the optimizer under DeepSpeed.
-    return AdamW(list(model.parameters()), lr=lr, weight_decay=weight_decay)
+    params = [p for p in model.parameters() if p.requires_grad]
+    return AdamW(params, lr=lr, weight_decay=weight_decay)
 
 
-def _score_blocks(accelerator, model, rollout: RolloutBatch, selector: BlockSelector, scorer: str, lora_enabled: bool, cfg: ExperimentConfig, step_seed: int) -> tuple[list[int], list[float]]:
+def _named_selector_params(model, lora_enabled: bool):
+    for name, param in model.named_parameters():
+        if name.startswith("value_head"):
+            continue
+        block_idx = extract_block_index(name)
+        if block_idx is None:
+            continue
+        if lora_enabled:
+            if _is_lora_param(name):
+                yield name, param, block_idx
+        else:
+            if not _is_lora_param(name):
+                yield name, param, block_idx
+
+
+def _select_blocks_from_adv_grad_energy(accelerator, model, rollout: RolloutBatch, selector: BlockSelector, lora_enabled: bool) -> tuple[list[int], list[float]]:
     unwrapped = accelerator.unwrap_model(model)
-    if scorer == "adv_grad_energy":
-        scores = compute_adv_grad_energy_scores(unwrapped, rollout, lora_enabled=lora_enabled)
-    elif scorer == "fisher_diag_energy":
-        scores = compute_fisher_diag_energy_scores(unwrapped, rollout, lora_enabled=lora_enabled)
-    elif scorer == "grad_norm":
-        scores = compute_grad_norm_scores(unwrapped, rollout, lora_enabled=lora_enabled, clip_range=cfg.ppo.clip_range, value_coef=cfg.ppo.value_coef, kl_coef=cfg.ppo.kl_coef)
-    elif scorer == "lisa_score":
-        scores = compute_lisa_scores(unwrapped, rollout, lora_enabled=lora_enabled, clip_range=cfg.ppo.clip_range, value_coef=cfg.ppo.value_coef, kl_coef=cfg.ppo.kl_coef)
-    elif scorer == "adagradselect_score":
-        scores = compute_adagradselect_scores(unwrapped, rollout, lora_enabled=lora_enabled, clip_range=cfg.ppo.clip_range, value_coef=cfg.ppo.value_coef, kl_coef=cfg.ppo.kl_coef)
-    elif scorer == "gate_grad":
-        scores = compute_gate_grad_scores(unwrapped, rollout, clip_range=cfg.ppo.clip_range, value_coef=cfg.ppo.value_coef, kl_coef=cfg.ppo.kl_coef)
-    elif scorer == "random":
-        scores = compute_random_scores(unwrapped, seed=cfg.train.seed + step_seed)
-    else:
-        raise ValueError(f"Unsupported selector scorer: {scorer}")
+    freeze_all_parameters(unwrapped)
 
-    scores = accelerator.reduce(scores.detach().float().to(accelerator.device), reduction="mean")
+    named_params = []
+    for name, param, block_idx in _named_selector_params(unwrapped, lora_enabled=lora_enabled):
+        param.requires_grad_(True)
+        named_params.append((name, param, block_idx))
+
+    if not named_params:
+        zero_scores = torch.zeros_like(selector.controller.gates.detach(), dtype=torch.float32)
+        result = selector.select_from_block_scores(zero_scores)
+        return result.selected_blocks, result.scores
+
+    outputs = model(input_ids=rollout.input_ids, attention_mask=rollout.attention_mask)
+    new_logprobs = shift_logprobs(outputs.logits, rollout.input_ids)
+    mask = rollout.response_mask
+    denom = mask.sum().clamp_min(1e-8)
+    # First-order proxy for block expected improvement:
+    #   g_b = E[A_t * grad_theta_b log pi(a_t | s_t)]
+    #   U_b ~ eta * ||g_b||^2
+    objective = ((new_logprobs * rollout.advantages * mask).sum() / denom)
+
+    grads = torch.autograd.grad(
+        objective,
+        [param for _, param, _ in named_params],
+        retain_graph=False,
+        create_graph=False,
+        allow_unused=True,
+    )
+
+    scores = torch.zeros_like(
+        selector.controller.gates.detach(),
+        dtype=torch.float32,
+        device=accelerator.device,
+    )
+    for grad, (_, _param, block_idx) in zip(grads, named_params):
+        if grad is None:
+            continue
+        block_energy = grad.detach().float().pow(2).sum()
+        if block_energy.device != scores.device:
+            block_energy = block_energy.to(scores.device)
+        scores[block_idx] += block_energy
+
+    scores = accelerator.reduce(scores, reduction="mean")
     result = selector.select_from_block_scores(scores)
     return result.selected_blocks, result.scores
 
@@ -332,8 +369,6 @@ def generate_rollout_batch(accelerator, model, reference_model, tokenizer, batch
 
 def run_evals(accelerator, model, tokenizer, cfg: ExperimentConfig, logger: JsonlLogger, step: int, phase: str, write_summary_to: Path | None = None) -> list[dict]:
     results_payloads: list[dict] = []
-    if not accelerator.is_main_process:
-        return results_payloads
 
     for split in cfg.train.eval_splits:
         eval_examples = load_task_examples(
@@ -355,10 +390,11 @@ def run_evals(accelerator, model, tokenizer, cfg: ExperimentConfig, logger: Json
             batch_size=cfg.train.per_device_batch_size,
             max_new_tokens=cfg.train.response_max_new_tokens,
             collect_rollouts=cfg.rollouts.save_eval_rollouts,
+            accelerator=accelerator,
         )
         if cfg.rollouts.max_eval_rollouts_per_save > 0:
             rollout_records = rollout_records[: cfg.rollouts.max_eval_rollouts_per_save]
-        if cfg.rollouts.save_eval_rollouts:
+        if cfg.rollouts.save_eval_rollouts and accelerator.is_main_process:
             save_eval_rollouts(
                 output_dir=cfg.train.output_dir,
                 step=step,
@@ -377,10 +413,11 @@ def run_evals(accelerator, model, tokenizer, cfg: ExperimentConfig, logger: Json
             "samples": result.samples,
             "saved_eval_rollouts": bool(cfg.rollouts.save_eval_rollouts),
         }
-        logger.log(payload)
-        results_payloads.append(payload)
+        if accelerator.is_main_process:
+            logger.log(payload)
+            results_payloads.append(payload)
 
-    if write_summary_to is not None:
+    if write_summary_to is not None and accelerator.is_main_process:
         write_summary_to.parent.mkdir(parents=True, exist_ok=True)
         with write_summary_to.open("w", encoding="utf-8") as f:
             json.dump(results_payloads, f, ensure_ascii=False, indent=2)
@@ -420,8 +457,6 @@ def run_training(cfg: ExperimentConfig) -> None:
     )
     train_loader = DataLoader(ExampleDataset(train_examples), batch_size=cfg.train.per_device_batch_size, shuffle=True, collate_fn=collate_examples)
 
-    # configure_trainable_parameters(model, None, cfg.train.full_tune and not cfg.selector.enabled, cfg.lora.enabled and not cfg.selector.enabled)
-    # optimizer = build_optimizer(model, cfg.train.learning_rate, cfg.train.weight_decay)
     configure_prepare_trainable_parameters(
         model,
         selector_enabled=cfg.selector.enabled,
@@ -429,7 +464,6 @@ def run_training(cfg: ExperimentConfig) -> None:
         lora_enabled=cfg.lora.enabled,
     )
     optimizer = build_optimizer(model, cfg.train.learning_rate, cfg.train.weight_decay)
-
     model, optimizer, train_loader = accelerator.prepare(model, optimizer, train_loader)
     reference_model.to(accelerator.device)
 
@@ -440,6 +474,9 @@ def run_training(cfg: ExperimentConfig) -> None:
     if accelerator.is_main_process:
         with (output_dir / "config.json").open("w", encoding="utf-8") as f:
             json.dump(asdict(cfg), f, ensure_ascii=False, indent=2)
+
+    safe_zero_grad(optimizer)
+    safe_zero_grad(model)
 
     accelerator.wait_for_everyone()
     save_checkpoint(
@@ -481,16 +518,37 @@ def run_training(cfg: ExperimentConfig) -> None:
         selected_blocks: list[int] = []
         selector_scores: list[float] = []
         if selector:
-            selected_blocks, selector_scores = _score_blocks(
-                accelerator=accelerator,
-                model=model,
-                rollout=rollout,
-                selector=selector,
-                scorer=cfg.selector.scorer,
-                lora_enabled=cfg.lora.enabled,
-                cfg=cfg,
-                step_seed=micro_step,
-            )
+            if cfg.selector.scorer == "adv_grad_energy":
+                selected_blocks, selector_scores = _select_blocks_from_adv_grad_energy(
+                    accelerator=accelerator,
+                    model=model,
+                    rollout=rollout,
+                    selector=selector,
+                    lora_enabled=cfg.lora.enabled,
+                )
+            elif cfg.selector.scorer == "gate_grad":
+                freeze_all_parameters(accelerator.unwrap_model(model))
+                selector.controller.gates.requires_grad_(True)
+                outputs = model(input_ids=rollout.input_ids, attention_mask=rollout.attention_mask)
+                scout_loss = ppo_loss(outputs.logits, outputs.values, rollout, cfg.ppo.clip_range, cfg.ppo.value_coef, cfg.ppo.kl_coef)
+                gate_grads = torch.autograd.grad(
+                    scout_loss.loss,
+                    selector.controller.gates,
+                    retain_graph=False,
+                    create_graph=False,
+                    allow_unused=True,
+                )[0]
+                if gate_grads is None:
+                    gate_grads = torch.zeros_like(selector.controller.gates)
+                gate_grads = accelerator.reduce(gate_grads.detach(), reduction="mean")
+                selector.controller.gates.grad = gate_grads
+                result = selector.select_from_gate_grads()
+                selected_blocks = result.selected_blocks
+                selector_scores = result.scores
+                selector.controller.gates.grad = None
+                selector.controller.gates.requires_grad_(False)
+            else:
+                raise ValueError(f"Unsupported selector scorer: {cfg.selector.scorer}")
 
         configure_trainable_parameters(
             accelerator.unwrap_model(model),
@@ -513,7 +571,6 @@ def run_training(cfg: ExperimentConfig) -> None:
         with accelerator.accumulate(model):
             outputs = model(input_ids=rollout.input_ids, attention_mask=rollout.attention_mask)
             loss_out = ppo_loss(outputs.logits, outputs.values, rollout, cfg.ppo.clip_range, cfg.ppo.value_coef, cfg.ppo.kl_coef)
-            safe_zero_grad(optimizer)
             accelerator.backward(loss_out.loss)
 
             unwrapped = accelerator.unwrap_model(model)
@@ -542,11 +599,11 @@ def run_training(cfg: ExperimentConfig) -> None:
             else:
                 monitored_probe_before, value_head_probe_before = {}, {}
 
-            optimizer.step()
-            safe_zero_grad(model)
-
             optimizer_step_applied = bool(accelerator.sync_gradients)
             if optimizer_step_applied:
+                optimizer.step()
+                safe_zero_grad(optimizer)
+                safe_zero_grad(model)
                 monitored_probe_after, _ = _capture_param_probe(monitored_named_params)
                 value_head_probe_after, _ = _capture_param_probe(value_head_named_params)
                 monitored_probe_delta_l2 = _probe_delta_l2(monitored_probe_before, monitored_probe_after)

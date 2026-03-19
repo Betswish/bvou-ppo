@@ -29,8 +29,6 @@ if __name__ == "__main__":
     parser.add_argument("--step-size", type=float, default=1e-4, help="One-step gain validation step size.")
     parser.add_argument("--fisher-damping", type=float, default=1e-8)
     parser.add_argument("--output-dir", type=str, default=None)
-    parser.add_argument("--proxies", type=str, nargs="+", default=None,
-                        help="Optional subset of proxies to evaluate. Defaults to the full stage-1 proxy-validity suite.")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -57,6 +55,5 @@ if __name__ == "__main__":
         step_size=args.step_size,
         fisher_damping=args.fisher_damping,
         output_dir=args.output_dir,
-        proxies=args.proxies,
     )
     print(json.dumps(summary, ensure_ascii=False, indent=2))

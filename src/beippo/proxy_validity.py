@@ -1,28 +1,27 @@
 from __future__ import annotations
 
 import json
+import math
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterable
 
 import torch
 from torch.utils.data import DataLoader, Dataset
-
-from beippo.block_scores import (
-    compute_adagradselect_scores,
-    compute_adv_grad_energy_scores,
-    compute_fisher_diag_energy_scores,
-    compute_gate_grad_scores,
-    compute_grad_norm_scores,
-    compute_lisa_scores,
-    compute_random_scores,
-    score_tensor_to_dict,
-)
 from beippo.config import ExperimentConfig
-from beippo.modeling import extract_block_index, freeze_all_parameters
-from beippo.ppo import RolloutBatch, build_response_mask, compute_returns_and_advantages, masked_mean, shift_logprobs
+from beippo.modeling import extract_block_index, freeze_all_parameters, get_decoder_layers
+from beippo.ppo import (
+    RolloutBatch,
+    build_response_mask,
+    compute_returns_and_advantages,
+    masked_mean,
+    ppo_loss,
+    shift_logprobs,
+)
 from beippo.registry import resolve_model
 from beippo.reward import exact_match_reward
+from beippo.selector import BlockSelector
 
 
 def _is_lora_param(name: str) -> bool:
@@ -34,8 +33,6 @@ class ProxyValiditySummary:
     proxy: str
     spearman: float | None
     pearson: float | None
-    topk_overlap: float | None
-    top1_hit: float | None
     num_blocks: int
 
 
@@ -89,29 +86,11 @@ def spearman_correlation(x: list[float], y: list[float]) -> float | None:
     return _pearson(_rankdata(x), _rankdata(y))
 
 
-def _topk_indices(score_map: dict[int, float], k: int) -> list[int]:
-    return [idx for idx, _ in sorted(score_map.items(), key=lambda kv: kv[1], reverse=True)[:k]]
-
-
-def _topk_overlap_fraction(score_map: dict[int, float], true_gain_map: dict[int, float], k: int) -> float | None:
-    if not score_map or not true_gain_map:
-        return None
-    ks = min(k, len(score_map), len(true_gain_map))
-    if ks <= 0:
-        return None
-    top_pred = set(_topk_indices(score_map, ks))
-    top_true = set(_topk_indices(true_gain_map, ks))
-    return float(len(top_pred & top_true) / ks)
-
-
-def _top1_hit(score_map: dict[int, float], true_gain_map: dict[int, float]) -> float | None:
-    if not score_map or not true_gain_map:
-        return None
-    pred_top = _topk_indices(score_map, 1)
-    true_top = _topk_indices(true_gain_map, 1)
-    if not pred_top or not true_top:
-        return None
-    return 1.0 if pred_top[0] == true_top[0] else 0.0
+def _current_lr(step: int, total_steps: int, base_lr: float, warmup_ratio: float) -> float:
+    warmup_steps = max(1, int(total_steps * warmup_ratio))
+    if step < warmup_steps:
+        return base_lr * (step + 1) / warmup_steps
+    return base_lr
 
 
 def _selector_named_params(model, lora_enabled: bool):
@@ -129,16 +108,22 @@ def _selector_named_params(model, lora_enabled: bool):
                 yield name, param, block_idx
 
 
+def _collect_block_params(model, lora_enabled: bool) -> dict[int, list[tuple[str, torch.nn.Parameter]]]:
+    by_block: dict[int, list[tuple[str, torch.nn.Parameter]]] = defaultdict(list)
+    for name, param, block_idx in _selector_named_params(model, lora_enabled=lora_enabled):
+        by_block[block_idx].append((name, param))
+    return dict(by_block)
+
+
 def _apply_lora_if_needed(model, cfg: ExperimentConfig):
     if cfg.lora.enabled:
-        from beippo.models.policy_value_model import apply_lora
         model = apply_lora(model, cfg.lora.r, cfg.lora.alpha, cfg.lora.dropout, cfg.lora.target_modules)
     return model
 
 
 def load_policy_and_reference(cfg: ExperimentConfig, checkpoint: str | None = None):
     from transformers import AutoModelForCausalLM
-    from beippo.models.policy_value_model import PolicyWithValueHead, build_tokenizer
+    from beippo.models.policy_value_model import PolicyWithValueHead, apply_lora, build_tokenizer
 
     model_path = checkpoint or cfg.train.model_name_or_path
     tokenizer = build_tokenizer(model_path)
@@ -226,7 +211,114 @@ def _score_objective_adv_pg(model, rollout: RolloutBatch) -> torch.Tensor:
     return masked_mean(rollout.advantages * new_logprobs, rollout.response_mask)
 
 
-def _block_objective_gain(model, rollout: RolloutBatch, block_params: list[torch.nn.Parameter], block_grads: list[torch.Tensor | None], step_size: float) -> float:
+def _score_objective_mean_logp(model, rollout: RolloutBatch) -> torch.Tensor:
+    outputs = model(input_ids=rollout.input_ids, attention_mask=rollout.attention_mask)
+    new_logprobs = shift_logprobs(outputs.logits, rollout.input_ids)
+    return masked_mean(new_logprobs, rollout.response_mask)
+
+
+def _gather_grads_by_block(named_params, grads) -> dict[int, list[torch.Tensor]]:
+    per_block: dict[int, list[torch.Tensor]] = defaultdict(list)
+    for (name, param, block_idx), grad in zip(named_params, grads):
+        if grad is None:
+            continue
+        per_block[block_idx].append(grad.detach())
+    return dict(per_block)
+
+
+def compute_adv_grad_energy_scores(model, rollout: RolloutBatch, lora_enabled: bool) -> dict[int, float]:
+    freeze_all_parameters(model)
+    named_params = []
+    for name, param, block_idx in _selector_named_params(model, lora_enabled=lora_enabled):
+        param.requires_grad_(True)
+        named_params.append((name, param, block_idx))
+    objective = _score_objective_adv_pg(model, rollout)
+    grads = torch.autograd.grad(objective, [p for _, p, _ in named_params], retain_graph=False, create_graph=False, allow_unused=True)
+    per_block = _gather_grads_by_block(named_params, grads)
+    scores: dict[int, float] = {}
+    for block_idx, tensors in per_block.items():
+        score = 0.0
+        for grad in tensors:
+            score += float(grad.float().pow(2).sum().item())
+        scores[block_idx] = score
+    freeze_all_parameters(model)
+    return scores
+
+
+def compute_grad_norm_scores(model, rollout: RolloutBatch, lora_enabled: bool, clip_range: float, value_coef: float, kl_coef: float) -> dict[int, float]:
+    freeze_all_parameters(model)
+    named_params = []
+    for name, param, block_idx in _selector_named_params(model, lora_enabled=lora_enabled):
+        param.requires_grad_(True)
+        named_params.append((name, param, block_idx))
+    outputs = model(input_ids=rollout.input_ids, attention_mask=rollout.attention_mask)
+    loss_out = ppo_loss(outputs.logits, outputs.values, rollout, clip_range, value_coef, kl_coef)
+    grads = torch.autograd.grad(loss_out.loss, [p for _, p, _ in named_params], retain_graph=False, create_graph=False, allow_unused=True)
+    per_block = _gather_grads_by_block(named_params, grads)
+    scores: dict[int, float] = {}
+    for block_idx, tensors in per_block.items():
+        score = 0.0
+        for grad in tensors:
+            score += float(grad.float().pow(2).sum().item())
+        scores[block_idx] = math.sqrt(score) if score > 0 else 0.0
+    freeze_all_parameters(model)
+    return scores
+
+
+def compute_fisher_diag_energy_scores(model, rollout: RolloutBatch, lora_enabled: bool, damping: float = 1e-8) -> dict[int, float]:
+    """Diagonal empirical-Fisher approximation to g^T F^{-1} g.
+
+    g comes from the advantage-weighted policy gradient objective.
+    F_diag is approximated from the masked mean log-prob objective.
+    """
+    freeze_all_parameters(model)
+    named_params = []
+    for name, param, block_idx in _selector_named_params(model, lora_enabled=lora_enabled):
+        param.requires_grad_(True)
+        named_params.append((name, param, block_idx))
+
+    g_obj = _score_objective_adv_pg(model, rollout)
+    fisher_obj = _score_objective_mean_logp(model, rollout)
+    params = [p for _, p, _ in named_params]
+    g_grads = torch.autograd.grad(g_obj, params, retain_graph=True, create_graph=False, allow_unused=True)
+    fisher_grads = torch.autograd.grad(fisher_obj, params, retain_graph=False, create_graph=False, allow_unused=True)
+
+    scores: dict[int, float] = defaultdict(float)
+    for (name, param, block_idx), g_grad, f_grad in zip(named_params, g_grads, fisher_grads):
+        if g_grad is None:
+            continue
+        g2 = g_grad.detach().float().pow(2)
+        if f_grad is None:
+            fdiag = torch.zeros_like(g2)
+        else:
+            fdiag = f_grad.detach().float().pow(2)
+        scores[block_idx] += float((g2 / (fdiag + damping)).sum().item())
+    freeze_all_parameters(model)
+    return dict(scores)
+
+
+def compute_gate_grad_scores(model, rollout: RolloutBatch, clip_range: float, value_coef: float, kl_coef: float) -> dict[int, float]:
+    freeze_all_parameters(model)
+    selector = BlockSelector(model, top_k=len(get_decoder_layers(model)))
+    selector.controller.gates.requires_grad_(True)
+    outputs = model(input_ids=rollout.input_ids, attention_mask=rollout.attention_mask)
+    loss_out = ppo_loss(outputs.logits, outputs.values, rollout, clip_range, value_coef, kl_coef)
+    gate_grads = torch.autograd.grad(loss_out.loss, selector.controller.gates, retain_graph=False, create_graph=False, allow_unused=True)[0]
+    if gate_grads is None:
+        gate_grads = torch.zeros_like(selector.controller.gates)
+    scores = {idx: float(val) for idx, val in enumerate(gate_grads.detach().abs().float().cpu().tolist())}
+    selector.close()
+    freeze_all_parameters(model)
+    return scores
+
+
+def _block_objective_gain(
+    model,
+    rollout: RolloutBatch,
+    block_params: list[torch.nn.Parameter],
+    block_grads: list[torch.Tensor],
+    step_size: float,
+) -> float:
     with torch.no_grad():
         originals = [p.detach().clone() for p in block_params]
     base_value = float(_score_objective_adv_pg(model, rollout).detach().item())
@@ -245,16 +337,17 @@ def _block_objective_gain(model, rollout: RolloutBatch, block_params: list[torch
 def compute_one_step_block_gains(model, rollout: RolloutBatch, lora_enabled: bool, candidate_blocks: list[int], step_size: float) -> dict[int, float]:
     freeze_all_parameters(model)
     named_params = []
-    target_set = set(candidate_blocks)
+    by_block: dict[int, list[tuple[str, torch.nn.Parameter]]] = defaultdict(list)
     for name, param, block_idx in _selector_named_params(model, lora_enabled=lora_enabled):
-        if block_idx in target_set:
+        if block_idx in set(candidate_blocks):
             param.requires_grad_(True)
             named_params.append((name, param, block_idx))
+            by_block[block_idx].append((name, param))
     objective = _score_objective_adv_pg(model, rollout)
     grads = torch.autograd.grad(objective, [p for _, p, _ in named_params], retain_graph=False, create_graph=False, allow_unused=True)
-    grads_by_block: dict[int, list[torch.Tensor | None]] = defaultdict(list)
+    grads_by_block: dict[int, list[torch.Tensor]] = defaultdict(list)
     params_by_block: dict[int, list[torch.nn.Parameter]] = defaultdict(list)
-    for (_name, param, block_idx), grad in zip(named_params, grads):
+    for (name, param, block_idx), grad in zip(named_params, grads):
         grads_by_block[block_idx].append(grad.detach() if grad is not None else None)
         params_by_block[block_idx].append(param)
     gains: dict[int, float] = {}
@@ -272,29 +365,6 @@ def _topk_union(score_maps: dict[str, dict[int, float]], top_k: int) -> list[int
     return sorted(chosen)
 
 
-def _compute_proxy_scores(model, rollout: RolloutBatch, lora_enabled: bool, cfg: ExperimentConfig, proxies: list[str], fisher_damping: float, seed_offset: int = 0) -> dict[str, dict[int, float]]:
-    score_maps: dict[str, dict[int, float]] = {}
-    for proxy_name in proxies:
-        if proxy_name == "adv_grad_energy":
-            scores = compute_adv_grad_energy_scores(model, rollout, lora_enabled=lora_enabled)
-        elif proxy_name == "fisher_diag_energy":
-            scores = compute_fisher_diag_energy_scores(model, rollout, lora_enabled=lora_enabled, damping=fisher_damping)
-        elif proxy_name == "grad_norm":
-            scores = compute_grad_norm_scores(model, rollout, lora_enabled=lora_enabled, clip_range=cfg.ppo.clip_range, value_coef=cfg.ppo.value_coef, kl_coef=cfg.ppo.kl_coef)
-        elif proxy_name == "gate_grad":
-            scores = compute_gate_grad_scores(model, rollout, clip_range=cfg.ppo.clip_range, value_coef=cfg.ppo.value_coef, kl_coef=cfg.ppo.kl_coef)
-        elif proxy_name == "lisa_score":
-            scores = compute_lisa_scores(model, rollout, lora_enabled=lora_enabled, clip_range=cfg.ppo.clip_range, value_coef=cfg.ppo.value_coef, kl_coef=cfg.ppo.kl_coef)
-        elif proxy_name == "adagradselect_score":
-            scores = compute_adagradselect_scores(model, rollout, lora_enabled=lora_enabled, clip_range=cfg.ppo.clip_range, value_coef=cfg.ppo.value_coef, kl_coef=cfg.ppo.kl_coef)
-        elif proxy_name == "random":
-            scores = compute_random_scores(model, seed=cfg.train.seed + seed_offset)
-        else:
-            raise ValueError(f"Unknown proxy: {proxy_name}")
-        score_maps[proxy_name] = score_tensor_to_dict(scores)
-    return score_maps
-
-
 def run_proxy_validity_experiment(
     cfg: ExperimentConfig,
     checkpoint: str | None = None,
@@ -306,21 +376,10 @@ def run_proxy_validity_experiment(
     step_size: float = 1e-4,
     fisher_damping: float = 1e-8,
     output_dir: str | None = None,
-    proxies: list[str] | None = None,
 ):
     if mode not in {"full", "lora", "bvou", "bvou_lora"}:
         raise ValueError(f"Unsupported mode for proxy validity: {mode}")
     lora_enabled = mode in {"lora", "bvou_lora"}
-    if proxies is None:
-        proxies = [
-            "adv_grad_energy",
-            "fisher_diag_energy",
-            "grad_norm",
-            "gate_grad",
-            "lisa_score",
-            "adagradselect_score",
-            "random",
-        ]
 
     model, reference_model, tokenizer = load_policy_and_reference(cfg, checkpoint=checkpoint)
     from beippo.data import load_task_examples
@@ -349,38 +408,34 @@ def run_proxy_validity_experiment(
         if batch_idx >= max_batches:
             break
         rollout, metadata = generate_rollout_batch(model, reference_model, tokenizer, batch, cfg)
-        proxy_scores = _compute_proxy_scores(
-            model=model,
-            rollout=rollout,
-            lora_enabled=lora_enabled,
-            cfg=cfg,
-            proxies=proxies,
-            fisher_damping=fisher_damping,
-            seed_offset=batch_idx,
-        )
+        proxy_scores = {
+            "adv_grad_energy": compute_adv_grad_energy_scores(model, rollout, lora_enabled=lora_enabled),
+            "fisher_diag_energy": compute_fisher_diag_energy_scores(model, rollout, lora_enabled=lora_enabled, damping=fisher_damping),
+            "grad_norm": compute_grad_norm_scores(model, rollout, lora_enabled=lora_enabled, clip_range=cfg.ppo.clip_range, value_coef=cfg.ppo.value_coef, kl_coef=cfg.ppo.kl_coef),
+            "gate_grad": compute_gate_grad_scores(model, rollout, clip_range=cfg.ppo.clip_range, value_coef=cfg.ppo.value_coef, kl_coef=cfg.ppo.kl_coef),
+        }
         candidate_blocks = _topk_union(proxy_scores, top_k=top_k)
         true_gains = compute_one_step_block_gains(model, rollout, lora_enabled=lora_enabled, candidate_blocks=candidate_blocks, step_size=step_size)
 
         correlations = {}
         for proxy_name, score_map in proxy_scores.items():
-            filtered_score_map = {b: float(score_map[b]) for b in candidate_blocks if b in score_map}
-            filtered_true_gains = {b: float(true_gains[b]) for b in candidate_blocks if b in true_gains}
-            xs = [filtered_score_map[b] for b in filtered_score_map if b in filtered_true_gains]
-            ys = [filtered_true_gains[b] for b in filtered_score_map if b in filtered_true_gains]
+            xs, ys = [], []
+            for block_idx in candidate_blocks:
+                if block_idx not in score_map or block_idx not in true_gains:
+                    continue
+                xs.append(float(score_map[block_idx]))
+                ys.append(float(true_gains[block_idx]))
             sp = spearman_correlation(xs, ys)
             pe = _pearson(xs, ys)
-            overlap = _topk_overlap_fraction(filtered_score_map, filtered_true_gains, top_k)
-            top1 = _top1_hit(filtered_score_map, filtered_true_gains)
             correlations[proxy_name] = {
                 "spearman": sp,
                 "pearson": pe,
-                "topk_overlap": overlap,
-                "top1_hit": top1,
                 "num_blocks": len(xs),
             }
-            for metric_name, metric_value in [("spearman", sp), ("pearson", pe), ("topk_overlap", overlap), ("top1_hit", top1)]:
-                if metric_value is not None:
-                    summary_acc[(proxy_name, metric_name)].append(float(metric_value))
+            if sp is not None:
+                summary_acc[(proxy_name, "spearman")].append(sp)
+            if pe is not None:
+                summary_acc[(proxy_name, "pearson")].append(pe)
 
         batch_record = {
             "batch_idx": batch_idx,
@@ -400,7 +455,6 @@ def run_proxy_validity_experiment(
             json.dump(batch_record, f, ensure_ascii=False, indent=2)
 
     summary = {
-        "protocol": "stage1_proxy_validity",
         "task": cfg.train.task_name,
         "mode": mode,
         "split": split,
@@ -409,15 +463,12 @@ def run_proxy_validity_experiment(
         "top_k": top_k,
         "step_size": step_size,
         "fisher_damping": fisher_damping,
-        "proxies": proxies,
         "proxy_summaries": {},
     }
-    for proxy_name in proxies:
+    for proxy_name in ["adv_grad_energy", "fisher_diag_energy", "grad_norm", "gate_grad"]:
         summary["proxy_summaries"][proxy_name] = {
             "mean_spearman": float(sum(summary_acc[(proxy_name, "spearman")]) / len(summary_acc[(proxy_name, "spearman")])) if summary_acc[(proxy_name, "spearman")] else None,
             "mean_pearson": float(sum(summary_acc[(proxy_name, "pearson")]) / len(summary_acc[(proxy_name, "pearson")])) if summary_acc[(proxy_name, "pearson")] else None,
-            "mean_topk_overlap": float(sum(summary_acc[(proxy_name, "topk_overlap")]) / len(summary_acc[(proxy_name, "topk_overlap")])) if summary_acc[(proxy_name, "topk_overlap")] else None,
-            "mean_top1_hit_rate": float(sum(summary_acc[(proxy_name, "top1_hit")]) / len(summary_acc[(proxy_name, "top1_hit")])) if summary_acc[(proxy_name, "top1_hit")] else None,
             "num_batches": len(batch_summaries),
         }
     with (out_root / "summary.json").open("w", encoding="utf-8") as f:
