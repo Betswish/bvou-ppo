@@ -64,6 +64,16 @@ def configure_trainable_parameters(model, selected_blocks, full_tune, lora_enabl
                 param.requires_grad_(True)
 
 
+
+def safe_zero_grad(obj) -> None:
+    zero_grad = getattr(obj, "zero_grad", None)
+    if zero_grad is None:
+        return
+    try:
+        zero_grad(set_to_none=True)
+    except TypeError:
+        zero_grad()
+
 def build_optimizer(model, lr: float, weight_decay: float) -> AdamW:
     params = [p for p in model.parameters() if p.requires_grad]
     return AdamW(params, lr=lr, weight_decay=weight_decay)
@@ -303,7 +313,7 @@ def run_training(cfg: ExperimentConfig) -> None:
             scout_loss = ppo_loss(outputs.logits, outputs.values, rollout, cfg.ppo.clip_range, cfg.ppo.value_coef, cfg.ppo.kl_coef)
             accelerator.backward(scout_loss.loss)
             selected_blocks = selector.select_from_gate_grads().selected_blocks
-            model.zero_grad(set_to_none=True)
+            safe_zero_grad(model)
             selector.controller.gates.requires_grad_(False)
 
         configure_trainable_parameters(
@@ -320,7 +330,7 @@ def run_training(cfg: ExperimentConfig) -> None:
         accelerator.backward(loss_out.loss)
         accelerator.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], cfg.ppo.max_grad_norm)
         optimizer.step()
-        model.zero_grad(set_to_none=True)
+        safe_zero_grad(model)
 
         trainable, total = count_trainable_parameters(accelerator.unwrap_model(model))
         metrics = {
