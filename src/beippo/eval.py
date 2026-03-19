@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
+from accelerate.utils import DistributedType
 from tqdm.auto import tqdm
 
 from beippo.reward import exact_match_reward
