@@ -19,7 +19,7 @@ class LoRAConfig:
 @dataclass
 class SelectorConfig:
     enabled: bool = False
-    scorer: str = "gate_grad"
+    scorer: str = "adv_grad_energy"
     top_k: int = 6
     select_every: int = 1
     search_upper_half_only: bool = False

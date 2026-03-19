@@ -38,6 +38,7 @@ class BlockGateController(nn.Module):
             if isinstance(output, tuple):
                 return (output[0] * gate, *output[1:])
             return output * gate
+
         return hook
 
     def saliency(self) -> torch.Tensor:
@@ -56,11 +57,17 @@ class BlockSelector:
     def close(self) -> None:
         self.controller.remove()
 
-    def select_from_gate_grads(self) -> SelectionResult:
-        scores = self.controller.saliency()
+    def _select_from_scores(self, scores: torch.Tensor) -> SelectionResult:
+        scores = scores.detach().float().cpu().clone()
         if self.search_upper_half_only:
             midpoint = scores.numel() // 2
             scores[:midpoint] = -1
         k = min(self.top_k, scores.numel())
         values, indices = torch.topk(scores, k=k)
         return SelectionResult(selected_blocks=indices.tolist(), scores=values.tolist())
+
+    def select_from_gate_grads(self) -> SelectionResult:
+        return self._select_from_scores(self.controller.saliency())
+
+    def select_from_block_scores(self, scores: torch.Tensor) -> SelectionResult:
+        return self._select_from_scores(scores)

@@ -100,6 +100,63 @@ def build_optimizer(model, lr: float, weight_decay: float) -> AdamW:
     return AdamW(list(model.parameters()), lr=lr, weight_decay=weight_decay)
 
 
+def _named_selector_params(model, lora_enabled: bool):
+    for name, param in model.named_parameters():
+        if name.startswith("value_head"):
+            continue
+        block_idx = extract_block_index(name)
+        if block_idx is None:
+            continue
+        if lora_enabled:
+            if _is_lora_param(name):
+                yield name, param, block_idx
+        else:
+            if not _is_lora_param(name):
+                yield name, param, block_idx
+
+
+def _select_blocks_from_adv_grad_energy(accelerator, model, rollout: RolloutBatch, selector: BlockSelector, lora_enabled: bool) -> tuple[list[int], list[float]]:
+    unwrapped = accelerator.unwrap_model(model)
+    freeze_all_parameters(unwrapped)
+
+    named_params = []
+    for name, param, block_idx in _named_selector_params(unwrapped, lora_enabled=lora_enabled):
+        param.requires_grad_(True)
+        named_params.append((name, param, block_idx))
+
+    if not named_params:
+        zero_scores = torch.zeros_like(selector.controller.gates.detach(), dtype=torch.float32)
+        result = selector.select_from_block_scores(zero_scores)
+        return result.selected_blocks, result.scores
+
+    outputs = model(input_ids=rollout.input_ids, attention_mask=rollout.attention_mask)
+    new_logprobs = shift_logprobs(outputs.logits, rollout.input_ids)
+    mask = rollout.response_mask
+    denom = mask.sum().clamp_min(1e-8)
+    # First-order proxy for block expected improvement:
+    #   g_b = E[A_t * grad_theta_b log pi(a_t | s_t)]
+    #   U_b ~ eta * ||g_b||^2
+    objective = ((new_logprobs * rollout.advantages * mask).sum() / denom)
+
+    grads = torch.autograd.grad(
+        objective,
+        [param for _, param, _ in named_params],
+        retain_graph=False,
+        create_graph=False,
+        allow_unused=True,
+    )
+
+    scores = torch.zeros_like(selector.controller.gates.detach(), dtype=torch.float32)
+    for grad, (_, _param, block_idx) in zip(grads, named_params):
+        if grad is None:
+            continue
+        scores[block_idx] += grad.detach().float().pow(2).sum()
+
+    scores = accelerator.reduce(scores, reduction="mean")
+    result = selector.select_from_block_scores(scores)
+    return result.selected_blocks, result.scores
+
+
 def _current_lr(step: int, total_steps: int, base_lr: float, warmup_ratio: float) -> float:
     warmup_steps = max(1, int(total_steps * warmup_ratio))
     if step < warmup_steps:
@@ -327,25 +384,39 @@ def run_training(cfg: ExperimentConfig) -> None:
         rollout, responses = generate_rollout_batch(accelerator, model, reference_model, tokenizer, batch, cfg)
 
         selected_blocks: list[int] = []
+        selector_scores: list[float] = []
         if selector:
-            freeze_all_parameters(accelerator.unwrap_model(model))
-            selector.controller.gates.requires_grad_(True)
-            outputs = model(input_ids=rollout.input_ids, attention_mask=rollout.attention_mask)
-            scout_loss = ppo_loss(outputs.logits, outputs.values, rollout, cfg.ppo.clip_range, cfg.ppo.value_coef, cfg.ppo.kl_coef)
-            gate_grads = torch.autograd.grad(
-                scout_loss.loss,
-                selector.controller.gates,
-                retain_graph=False,
-                create_graph=False,
-                allow_unused=True,
-            )[0]
-            if gate_grads is None:
-                gate_grads = torch.zeros_like(selector.controller.gates)
-            gate_grads = accelerator.reduce(gate_grads.detach(), reduction="mean")
-            selector.controller.gates.grad = gate_grads
-            selected_blocks = selector.select_from_gate_grads().selected_blocks
-            selector.controller.gates.grad = None
-            selector.controller.gates.requires_grad_(False)
+            if cfg.selector.scorer == "adv_grad_energy":
+                selected_blocks, selector_scores = _select_blocks_from_adv_grad_energy(
+                    accelerator=accelerator,
+                    model=model,
+                    rollout=rollout,
+                    selector=selector,
+                    lora_enabled=cfg.lora.enabled,
+                )
+            elif cfg.selector.scorer == "gate_grad":
+                freeze_all_parameters(accelerator.unwrap_model(model))
+                selector.controller.gates.requires_grad_(True)
+                outputs = model(input_ids=rollout.input_ids, attention_mask=rollout.attention_mask)
+                scout_loss = ppo_loss(outputs.logits, outputs.values, rollout, cfg.ppo.clip_range, cfg.ppo.value_coef, cfg.ppo.kl_coef)
+                gate_grads = torch.autograd.grad(
+                    scout_loss.loss,
+                    selector.controller.gates,
+                    retain_graph=False,
+                    create_graph=False,
+                    allow_unused=True,
+                )[0]
+                if gate_grads is None:
+                    gate_grads = torch.zeros_like(selector.controller.gates)
+                gate_grads = accelerator.reduce(gate_grads.detach(), reduction="mean")
+                selector.controller.gates.grad = gate_grads
+                result = selector.select_from_gate_grads()
+                selected_blocks = result.selected_blocks
+                selector_scores = result.scores
+                selector.controller.gates.grad = None
+                selector.controller.gates.requires_grad_(False)
+            else:
+                raise ValueError(f"Unsupported selector scorer: {cfg.selector.scorer}")
 
         configure_trainable_parameters(
             accelerator.unwrap_model(model),
@@ -374,6 +445,8 @@ def run_training(cfg: ExperimentConfig) -> None:
             "trainable_params": trainable,
             "total_params": total,
             "selected_blocks": selected_blocks,
+            "selector_scorer": cfg.selector.scorer if selector else None,
+            "selector_scores": selector_scores,
         }
         if accelerator.is_main_process and cfg.rollouts.save_train_rollouts:
             limited_batch = batch

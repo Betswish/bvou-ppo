@@ -37,7 +37,7 @@ lora:
   - o_proj
 selector:
   enabled: false
-  scorer: gate_grad
+  scorer: adv_grad_energy
   top_k: 6
   select_every: 1
   search_upper_half_only: false
