@@ -46,22 +46,42 @@ def _is_lora_param(name: str) -> bool:
 
 
 def configure_trainable_parameters(model, selected_blocks, full_tune, lora_enabled):
+    """Toggle requires_grad for the current training mode.
+
+    - full: all params trainable
+    - lora: all LoRA params + value head trainable
+    - bvou: only selected full-rank blocks + value head trainable
+    - bvou_lora: only selected LoRA params inside selected blocks + value head trainable
+    """
     freeze_all_parameters(model)
     for p in model.value_head.parameters():
         p.requires_grad_(True)
+
+    using_selector = selected_blocks is not None
     selected = set(selected_blocks or [])
+
     for name, param in model.named_parameters():
         if name.startswith("value_head"):
             continue
-        block_idx = extract_block_index(name)
-        if full_tune and not selected_blocks:
+
+        if full_tune and not using_selector:
             param.requires_grad_(True)
-        elif block_idx is not None and block_idx in selected:
-            if lora_enabled:
-                if _is_lora_param(name):
-                    param.requires_grad_(True)
-            else:
+            continue
+
+        if lora_enabled and not using_selector:
+            if _is_lora_param(name):
                 param.requires_grad_(True)
+            continue
+
+        block_idx = extract_block_index(name)
+        if block_idx is None or block_idx not in selected:
+            continue
+
+        if lora_enabled:
+            if _is_lora_param(name):
+                param.requires_grad_(True)
+        else:
+            param.requires_grad_(True)
 
 
 
@@ -75,8 +95,9 @@ def safe_zero_grad(obj) -> None:
         zero_grad()
 
 def build_optimizer(model, lr: float, weight_decay: float) -> AdamW:
-    params = [p for p in model.parameters() if p.requires_grad]
-    return AdamW(params, lr=lr, weight_decay=weight_decay)
+    # Keep all parameters in the optimizer so selector-based modes can toggle
+    # requires_grad dynamically without rebuilding the optimizer under DeepSpeed.
+    return AdamW(list(model.parameters()), lr=lr, weight_decay=weight_decay)
 
 
 def _current_lr(step: int, total_steps: int, base_lr: float, warmup_ratio: float) -> float:
@@ -311,9 +332,19 @@ def run_training(cfg: ExperimentConfig) -> None:
             selector.controller.gates.requires_grad_(True)
             outputs = model(input_ids=rollout.input_ids, attention_mask=rollout.attention_mask)
             scout_loss = ppo_loss(outputs.logits, outputs.values, rollout, cfg.ppo.clip_range, cfg.ppo.value_coef, cfg.ppo.kl_coef)
-            accelerator.backward(scout_loss.loss)
+            gate_grads = torch.autograd.grad(
+                scout_loss.loss,
+                selector.controller.gates,
+                retain_graph=False,
+                create_graph=False,
+                allow_unused=True,
+            )[0]
+            if gate_grads is None:
+                gate_grads = torch.zeros_like(selector.controller.gates)
+            gate_grads = accelerator.reduce(gate_grads.detach(), reduction="mean")
+            selector.controller.gates.grad = gate_grads
             selected_blocks = selector.select_from_gate_grads().selected_blocks
-            safe_zero_grad(model)
+            selector.controller.gates.grad = None
             selector.controller.gates.requires_grad_(False)
 
         configure_trainable_parameters(
@@ -323,10 +354,9 @@ def run_training(cfg: ExperimentConfig) -> None:
             cfg.lora.enabled,
         )
 
-        optimizer = build_optimizer(accelerator.unwrap_model(model), lr, cfg.train.weight_decay)
         outputs = model(input_ids=rollout.input_ids, attention_mask=rollout.attention_mask)
         loss_out = ppo_loss(outputs.logits, outputs.values, rollout, cfg.ppo.clip_range, cfg.ppo.value_coef, cfg.ppo.kl_coef)
-        optimizer.zero_grad(set_to_none=True)
+        safe_zero_grad(optimizer)
         accelerator.backward(loss_out.loss)
         accelerator.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], cfg.ppo.max_grad_norm)
         optimizer.step()
