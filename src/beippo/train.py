@@ -133,6 +133,27 @@ def safe_zero_grad(obj) -> None:
         zero_grad()
 
 
+
+
+def _is_zero3(accelerator) -> bool:
+    if accelerator is None:
+        return False
+    try:
+        plugin = getattr(accelerator.state, "deepspeed_plugin", None)
+        if plugin is None:
+            return False
+        cfg = getattr(plugin, "deepspeed_config", None)
+        if isinstance(cfg, dict):
+            stage = cfg.get("zero_optimization", {}).get("stage", 0)
+            return int(stage) == 3
+        hf_ds = getattr(plugin, "hf_ds_config", None)
+        if hf_ds is not None and hasattr(hf_ds, "config"):
+            stage = hf_ds.config.get("zero_optimization", {}).get("stage", 0)
+            return int(stage) == 3
+    except Exception:
+        return False
+    return False
+
 def _iter_monitored_named_params(model, selected_blocks, lora_enabled: bool, include_value_head: bool = False):
     selected = set(selected_blocks or [])
     using_selector = selected_blocks is not None
@@ -170,6 +191,25 @@ def _grad_l2_and_count(named_params) -> tuple[float, int]:
     if total is None:
         return 0.0, 0
     return float(total.sqrt().item()), count
+
+
+def _capture_exact_named_params(named_params):
+    snapshot = {}
+    total_numel = 0
+    for name, param in named_params:
+        vals = param.detach().reshape(-1).float().cpu().clone()
+        snapshot[name] = vals
+        total_numel += int(vals.numel())
+    return snapshot, total_numel
+
+
+def _should_use_exact_snapshot(named_params, max_exact_numel: int = 8_000_000) -> bool:
+    total = 0
+    for _name, param in named_params:
+        total += int(param.numel())
+        if total > max_exact_numel:
+            return False
+    return True
 
 
 def _capture_param_probe(named_params, max_per_tensor: int = 16):
@@ -327,7 +367,8 @@ def generate_rollout_batch(accelerator, model, reference_model, tokenizer, batch
     prompt_lengths = prompt_tokens.attention_mask.sum(dim=1)
 
     spec = resolve_model(cfg.train.model_name_or_path)
-    generations = accelerator.unwrap_model(model).generate(
+    generation_model = model if _is_zero3(accelerator) else accelerator.unwrap_model(model)
+    generations = generation_model.generate(
         **prompt_tokens,
         do_sample=True,
         temperature=spec.recommended_temperature,
@@ -382,7 +423,7 @@ def run_evals(accelerator, model, tokenizer, cfg: ExperimentConfig, logger: Json
             deepseek_prompt_date=cfg.train.deepseek_prompt_date,
         )
         result, rollout_records = run_task_eval(
-            accelerator.unwrap_model(model),
+            model,
             tokenizer,
             cfg.train.task_name,
             split,
@@ -550,12 +591,13 @@ def run_training(cfg: ExperimentConfig) -> None:
             else:
                 raise ValueError(f"Unsupported selector scorer: {cfg.selector.scorer}")
 
-        configure_trainable_parameters(
-            accelerator.unwrap_model(model),
-            selected_blocks if selector else None,
-            cfg.train.full_tune and not selector,
-            cfg.lora.enabled,
-        )
+        if selector is not None:
+            configure_trainable_parameters(
+                accelerator.unwrap_model(model),
+                selected_blocks,
+                cfg.train.full_tune and not selector,
+                cfg.lora.enabled,
+            )
 
         monitored_grad_l2 = 0.0
         monitored_grad_tensors = 0
@@ -592,9 +634,17 @@ def run_training(cfg: ExperimentConfig) -> None:
             monitored_grad_l2, monitored_grad_tensors = _grad_l2_and_count(monitored_named_params)
             value_head_grad_l2, value_head_grad_tensors = _grad_l2_and_count(value_head_named_params)
 
+            monitored_use_exact = _should_use_exact_snapshot(monitored_named_params)
+            value_use_exact = _should_use_exact_snapshot(value_head_named_params)
             if accelerator.sync_gradients:
-                monitored_probe_before, monitored_probe_numel = _capture_param_probe(monitored_named_params)
-                value_head_probe_before, value_head_probe_numel = _capture_param_probe(value_head_named_params)
+                if monitored_use_exact:
+                    monitored_probe_before, monitored_probe_numel = _capture_exact_named_params(monitored_named_params)
+                else:
+                    monitored_probe_before, monitored_probe_numel = _capture_param_probe(monitored_named_params)
+                if value_use_exact:
+                    value_head_probe_before, value_head_probe_numel = _capture_exact_named_params(value_head_named_params)
+                else:
+                    value_head_probe_before, value_head_probe_numel = _capture_param_probe(value_head_named_params)
                 accelerator.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], cfg.ppo.max_grad_norm)
             else:
                 monitored_probe_before, value_head_probe_before = {}, {}
@@ -604,8 +654,14 @@ def run_training(cfg: ExperimentConfig) -> None:
                 optimizer.step()
                 safe_zero_grad(optimizer)
                 safe_zero_grad(model)
-                monitored_probe_after, _ = _capture_param_probe(monitored_named_params)
-                value_head_probe_after, _ = _capture_param_probe(value_head_named_params)
+                if monitored_use_exact:
+                    monitored_probe_after, _ = _capture_exact_named_params(monitored_named_params)
+                else:
+                    monitored_probe_after, _ = _capture_param_probe(monitored_named_params)
+                if value_use_exact:
+                    value_head_probe_after, _ = _capture_exact_named_params(value_head_named_params)
+                else:
+                    value_head_probe_after, _ = _capture_param_probe(value_head_named_params)
                 monitored_probe_delta_l2 = _probe_delta_l2(monitored_probe_before, monitored_probe_after)
                 value_head_probe_delta_l2 = _probe_delta_l2(value_head_probe_before, value_head_probe_after)
 

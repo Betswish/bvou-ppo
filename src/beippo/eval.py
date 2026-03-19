@@ -17,9 +17,33 @@ class EvalResult:
     exact_match: float
 
 
+
+
+def _is_zero3(accelerator) -> bool:
+    if accelerator is None:
+        return False
+    try:
+        plugin = getattr(accelerator.state, "deepspeed_plugin", None)
+        if plugin is None:
+            return False
+        cfg = getattr(plugin, "deepspeed_config", None)
+        if isinstance(cfg, dict):
+            stage = cfg.get("zero_optimization", {}).get("stage", 0)
+            return int(stage) == 3
+        hf_ds = getattr(plugin, "hf_ds_config", None)
+        if hf_ds is not None and hasattr(hf_ds, "config"):
+            stage = hf_ds.config.get("zero_optimization", {}).get("stage", 0)
+            return int(stage) == 3
+    except Exception:
+        return False
+    return False
+
+
 @torch.no_grad()
 def run_task_eval(model, tokenizer, task_name: str, split: str, examples, batch_size: int = 4, max_new_tokens: int = 8, collect_rollouts: bool = False, accelerator=None):
-    device = next(model.parameters()).device
+    zero3 = _is_zero3(accelerator)
+    eval_model = model if zero3 and accelerator is not None else (accelerator.unwrap_model(model) if accelerator is not None else model)
+    device = accelerator.device if accelerator is not None else next(eval_model.parameters()).device
     rank = accelerator.process_index if accelerator is not None else 0
     world_size = accelerator.num_processes if accelerator is not None else 1
     local_examples = examples[rank::world_size]
@@ -41,7 +65,7 @@ def run_task_eval(model, tokenizer, task_name: str, split: str, examples, batch_
         )
         if accelerator is not None and accelerator.num_processes > 1:
             gen_kwargs["synced_gpus"] = True
-        generations = model.generate(**tokens, **gen_kwargs)
+        generations = eval_model.generate(**tokens, **gen_kwargs)
         decoded = tokenizer.batch_decode(generations[:, tokens.input_ids.shape[1]:], skip_special_tokens=True)
         for pred, ex in zip(decoded, batch):
             is_correct = int(exact_match_reward(task_name, pred, ex.gold_label))
