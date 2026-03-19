@@ -426,3 +426,9 @@ accelerate launch   --use_deepspeed   --deepspeed_config_file deepspeed/zero2.js
 ```
 
 Then expand to the remaining configs.
+
+
+## Config compatibility note
+
+This branch accepts both `train.eval_splits: [validation]` and the older alias `train.eval_split: validation`.
+It also ignores legacy YAML keys such as `generation_temperature`, `generation_top_p`, `generation_do_sample`, `ppo.gamma`, `ppo.lam`, and `selector.include_value_loss_in_scout`.

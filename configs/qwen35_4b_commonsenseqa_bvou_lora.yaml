@@ -2,60 +2,48 @@ train:
   run_name: qwen35_4b_commonsenseqa_bvou_lora
   output_dir: outputs/qwen35_4b_commonsenseqa_bvou_lora
   model_name_or_path: Qwen/Qwen3.5-4B
+  model_family: qwen35
   task_name: commonsenseqa
   train_split: train
-  eval_split: validation
-  max_train_samples: 8000
-  max_eval_samples: 1000
-  num_train_steps: 400
-  per_device_batch_size: 2
-  gradient_accumulation_steps: 1
-  learning_rate: 1.0e-4
-  weight_decay: 0.0
-  warmup_ratio: 0.03
-  max_grad_norm: 1.0
-  bf16: true
-  gradient_checkpointing: true
-  prompt_max_length: 640
-  response_max_new_tokens: 4
-  generation_temperature: 0.0
-  generation_top_p: 1.0
-  generation_do_sample: false
+  eval_splits:
+  - validation
   enable_thinking: false
   use_official_system_prompt: false
-  eval_every: 50
-  save_every: 50
-  seed: 42
+  max_train_samples: 8000
+  max_eval_samples: 1000
+  per_device_batch_size: 2
+  gradient_accumulation_steps: 8
+  response_max_new_tokens: 8
+  num_train_steps: 500
+  learning_rate: 2.0e-05
   full_tune: false
-
-ppo:
-  clip_range: 0.2
-  value_coef: 0.5
-  kl_coef: 0.02
-  gamma: 1.0
-  lam: 1.0
-
+  gradient_checkpointing: true
+  save_every: 100
+  eval_every: 100
+  report_to: none
+  prompt_max_length: 768
+  weight_decay: 0.01
+  warmup_ratio: 0.03
+  bf16: true
 lora:
   enabled: true
   r: 16
   alpha: 32
   dropout: 0.05
-  target_modules: [q_proj, k_proj, v_proj, o_proj]
-
+  target_modules:
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
 selector:
   enabled: true
   scorer: adv_grad_energy
-  top_k: 4
-  select_every: 4
-  active_only_optimizer_state: true
-  search_upper_half_only: true
-  include_value_loss_in_scout: true
-  candidate_last_n_layers: null
-
-  candidate_start_layer: null
-  candidate_end_layer: null
+  top_k: 6
+  select_every: 1
+  search_upper_half_only: false
+  active_only_optimizer_state: false
 rollouts:
-  save_train_rollouts: false
-  save_eval_rollouts: false
+  save_train_rollouts: true
+  save_eval_rollouts: true
   max_train_rollouts_per_save: 0
   max_eval_rollouts_per_save: 0

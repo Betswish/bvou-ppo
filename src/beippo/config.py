@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +24,9 @@ class SelectorConfig:
     select_every: int = 1
     search_upper_half_only: bool = False
     active_only_optimizer_state: bool = False
+    candidate_start_layer: int | None = None
+    candidate_end_layer: int | None = None
+    candidate_last_n_layers: int | None = None
 
 
 @dataclass
@@ -93,21 +96,59 @@ def _deep_update(base: dict[str, Any], updates: dict[str, Any]) -> dict[str, Any
     return merged
 
 
+def _filter_known_keys(cls, values: dict[str, Any]) -> dict[str, Any]:
+    known = {f.name for f in fields(cls)}
+    return {k: v for k, v in values.items() if k in known}
+
+
+def _sanitize_raw(raw: dict[str, Any]) -> dict[str, Any]:
+    raw = dict(raw or {})
+    train = dict(raw.get("train") or {})
+    ppo = dict(raw.get("ppo") or {})
+    selector = dict(raw.get("selector") or {})
+
+    # Backward-compatible alias: eval_split -> eval_splits
+    if "eval_split" in train and "eval_splits" not in train:
+        val = train.pop("eval_split")
+        train["eval_splits"] = [val] if isinstance(val, str) else val
+
+    # Backward-compatible move: train.max_grad_norm -> ppo.max_grad_norm
+    if "max_grad_norm" in train and "max_grad_norm" not in ppo:
+        ppo["max_grad_norm"] = train.pop("max_grad_norm")
+
+    # Ignore legacy generation knobs not represented in TrainConfig in this branch.
+    for key in ["generation_temperature", "generation_top_p", "generation_do_sample"]:
+        train.pop(key, None)
+
+    # Ignore legacy PPO keys not represented in this branch.
+    for key in ["gamma", "lam"]:
+        ppo.pop(key, None)
+
+    # Ignore legacy selector knobs not represented in this branch.
+    selector.pop("include_value_loss_in_scout", None)
+
+    raw["train"] = train
+    raw["ppo"] = ppo
+    raw["selector"] = selector
+    return raw
+
+
 def load_config(path: str | Path) -> ExperimentConfig:
     with Path(path).open("r", encoding="utf-8") as f:
         raw = yaml.safe_load(f) or {}
+    raw = _sanitize_raw(raw)
     base = {
-        "train": TrainConfig().__dict__,
-        "ppo": PPOConfig().__dict__,
-        "lora": LoRAConfig().__dict__,
-        "selector": SelectorConfig().__dict__,
-        "rollouts": RolloutSaveConfig().__dict__,
+        "train": asdict(TrainConfig()),
+        "ppo": asdict(PPOConfig()),
+        "lora": asdict(LoRAConfig()),
+        "selector": asdict(SelectorConfig()),
+        "rollouts": asdict(RolloutSaveConfig()),
     }
     merged = _deep_update(base, raw)
     return ExperimentConfig(
-        train=TrainConfig(**merged["train"]),
-        ppo=PPOConfig(**merged["ppo"]),
-        lora=LoRAConfig(**merged["lora"]),
-        selector=SelectorConfig(**merged["selector"]),
-        rollouts=RolloutSaveConfig(**merged["rollouts"]),
+        train=TrainConfig(**_filter_known_keys(TrainConfig, merged["train"])),
+        ppo=PPOConfig(**_filter_known_keys(PPOConfig, merged["ppo"])),
+        lora=LoRAConfig(**_filter_known_keys(LoRAConfig, merged["lora"])),
+        selector=SelectorConfig(**_filter_known_keys(SelectorConfig, merged["selector"])),
+        rollouts=RolloutSaveConfig(**_filter_known_keys(RolloutSaveConfig, merged["rollouts"])),
     )
