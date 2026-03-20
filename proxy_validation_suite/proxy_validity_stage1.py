@@ -272,6 +272,26 @@ def _topk_union(score_maps: dict[str, dict[int, float]], top_k: int) -> list[int
     return sorted(chosen)
 
 
+def _aligned_xy(score_map: dict[int, float], true_gains: dict[int, float], blocks: Iterable[int]):
+    xs, ys = [], []
+    for block_idx in blocks:
+        if block_idx in score_map and block_idx in true_gains:
+            xs.append(float(score_map[block_idx]))
+            ys.append(float(true_gains[block_idx]))
+    return xs, ys
+
+
+def _metric_bundle(score_map: dict[int, float], true_gains: dict[int, float], blocks: list[int], top_k: int):
+    xs, ys = _aligned_xy(score_map, true_gains, blocks)
+    return {
+        'spearman': spearman_correlation(xs, ys),
+        'pearson': _pearson(xs, ys),
+        'topk_overlap': topk_overlap({k: score_map[k] for k in blocks if k in score_map}, {k: true_gains[k] for k in blocks if k in true_gains}, top_k),
+        'top1_hit_rate': top1_hit({k: score_map[k] for k in blocks if k in score_map}, {k: true_gains[k] for k in blocks if k in true_gains}),
+        'num_blocks': len(xs),
+    }
+
+
 def topk_overlap(score_map: dict[int, float], true_gains: dict[int, float], k: int) -> float | None:
     if not score_map or not true_gains:
         return None
@@ -312,7 +332,7 @@ def run_proxy_validation_stage1(cfg: ExperimentConfig, checkpoint=None, split='v
 
     if output_dir is None:
         output_dir = cfg.train.output_dir
-    out_root = Path(output_dir+f"_{max_samples}_{max_batches}_{top_k}") / 'proxy_validation_stage1'
+    out_root = Path(output_dir + f"_{max_samples}_{max_batches}_{top_k}") / 'proxy_validation_stage1'
     out_root.mkdir(parents=True, exist_ok=True)
 
     allowed_blocks = _allowed_block_indices(model, cfg)
@@ -345,39 +365,34 @@ def run_proxy_validation_stage1(cfg: ExperimentConfig, checkpoint=None, split='v
             else:
                 raise ValueError(f'Unknown proxy: {proxy}')
 
+        all_allowed_blocks = sorted(allowed_blocks)
         candidate_blocks = _topk_union(score_maps, top_k=top_k)
-        true_gains = compute_one_step_block_gains(model, rollout, cfg, lora_enabled, candidate_blocks, step_size, allowed_blocks)
+        true_gains_all_layers = compute_one_step_block_gains(model, rollout, cfg, lora_enabled, all_allowed_blocks, step_size, allowed_blocks)
+        true_gains_topk_union = {idx: true_gains_all_layers[idx] for idx in candidate_blocks if idx in true_gains_all_layers}
 
         metrics = {}
         for proxy, score_map in score_maps.items():
-            xs, ys = [], []
-            for block_idx in candidate_blocks:
-                if block_idx in score_map and block_idx in true_gains:
-                    xs.append(float(score_map[block_idx]))
-                    ys.append(float(true_gains[block_idx]))
-            sp = spearman_correlation(xs, ys)
-            pe = _pearson(xs, ys)
-            overlap = topk_overlap(score_map, true_gains, top_k)
-            hit = top1_hit(score_map, true_gains)
+            all_layer_metrics = _metric_bundle(score_map, true_gains_all_layers, all_allowed_blocks, top_k)
+            topk_union_metrics = _metric_bundle(score_map, true_gains_topk_union, candidate_blocks, top_k)
             metrics[proxy] = {
-                'spearman': sp,
-                'pearson': pe,
-                'topk_overlap': overlap,
-                'top1_hit_rate': hit,
-                'num_blocks': len(xs),
+                'all_layers': all_layer_metrics,
+                'topk_union': topk_union_metrics,
             }
-            for key, val in [('spearman', sp), ('pearson', pe), ('topk_overlap', overlap), ('top1_hit_rate', hit)]:
-                if val is not None:
-                    summary_acc[(proxy, key)].append(val)
+            for scope_name, scope_metrics in [('all_layers', all_layer_metrics), ('topk_union', topk_union_metrics)]:
+                for key in ['spearman', 'pearson', 'topk_overlap', 'top1_hit_rate']:
+                    val = scope_metrics.get(key)
+                    if val is not None:
+                        summary_acc[(proxy, scope_name, key)].append(val)
 
         batch_record = {
             'batch_idx': batch_idx,
             'task': cfg.train.task_name,
             'mode': mode,
             'avg_reward': float(rollout.rewards.mean().item()),
-            'allowed_blocks': sorted(allowed_blocks),
-            'candidate_blocks': candidate_blocks,
-            'true_one_step_gains': true_gains,
+            'allowed_blocks': all_allowed_blocks,
+            'candidate_blocks_topk_union': candidate_blocks,
+            'true_one_step_gains_all_layers': true_gains_all_layers,
+            'true_one_step_gains_topk_union': true_gains_topk_union,
             'proxy_scores': score_maps,
             'metrics': metrics,
             'queries': metadata['queries'],
@@ -401,11 +416,20 @@ def run_proxy_validation_stage1(cfg: ExperimentConfig, checkpoint=None, split='v
     }
     for proxy in proxy_names:
         summary['proxy_summaries'][proxy] = {
-            'mean_spearman': (sum(summary_acc[(proxy, 'spearman')]) / len(summary_acc[(proxy, 'spearman')])) if summary_acc[(proxy, 'spearman')] else None,
-            'mean_pearson': (sum(summary_acc[(proxy, 'pearson')]) / len(summary_acc[(proxy, 'pearson')])) if summary_acc[(proxy, 'pearson')] else None,
-            'mean_topk_overlap': (sum(summary_acc[(proxy, 'topk_overlap')]) / len(summary_acc[(proxy, 'topk_overlap')])) if summary_acc[(proxy, 'topk_overlap')] else None,
-            'mean_top1_hit_rate': (sum(summary_acc[(proxy, 'top1_hit_rate')]) / len(summary_acc[(proxy, 'top1_hit_rate')])) if summary_acc[(proxy, 'top1_hit_rate')] else None,
-            'num_batches': len(batch_summaries),
+            'all_layers': {
+                'mean_spearman': (sum(summary_acc[(proxy, 'all_layers', 'spearman')]) / len(summary_acc[(proxy, 'all_layers', 'spearman')])) if summary_acc[(proxy, 'all_layers', 'spearman')] else None,
+                'mean_pearson': (sum(summary_acc[(proxy, 'all_layers', 'pearson')]) / len(summary_acc[(proxy, 'all_layers', 'pearson')])) if summary_acc[(proxy, 'all_layers', 'pearson')] else None,
+                'mean_topk_overlap': (sum(summary_acc[(proxy, 'all_layers', 'topk_overlap')]) / len(summary_acc[(proxy, 'all_layers', 'topk_overlap')])) if summary_acc[(proxy, 'all_layers', 'topk_overlap')] else None,
+                'mean_top1_hit_rate': (sum(summary_acc[(proxy, 'all_layers', 'top1_hit_rate')]) / len(summary_acc[(proxy, 'all_layers', 'top1_hit_rate')])) if summary_acc[(proxy, 'all_layers', 'top1_hit_rate')] else None,
+                'num_batches': len(batch_summaries),
+            },
+            'topk_union': {
+                'mean_spearman': (sum(summary_acc[(proxy, 'topk_union', 'spearman')]) / len(summary_acc[(proxy, 'topk_union', 'spearman')])) if summary_acc[(proxy, 'topk_union', 'spearman')] else None,
+                'mean_pearson': (sum(summary_acc[(proxy, 'topk_union', 'pearson')]) / len(summary_acc[(proxy, 'topk_union', 'pearson')])) if summary_acc[(proxy, 'topk_union', 'pearson')] else None,
+                'mean_topk_overlap': (sum(summary_acc[(proxy, 'topk_union', 'topk_overlap')]) / len(summary_acc[(proxy, 'topk_union', 'topk_overlap')])) if summary_acc[(proxy, 'topk_union', 'topk_overlap')] else None,
+                'mean_top1_hit_rate': (sum(summary_acc[(proxy, 'topk_union', 'top1_hit_rate')]) / len(summary_acc[(proxy, 'topk_union', 'top1_hit_rate')])) if summary_acc[(proxy, 'topk_union', 'top1_hit_rate')] else None,
+                'num_batches': len(batch_summaries),
+            },
         }
     with (out_root / 'summary.json').open('w', encoding='utf-8') as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)

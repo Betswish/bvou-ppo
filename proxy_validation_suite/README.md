@@ -7,8 +7,7 @@ It is intended to answer the question:
 
 ## What this suite measures
 
-For each batch, the script computes a set of block-level proxy scores, then compares them against a
-`true_one_step_gain` target obtained by taking a **single local update step on one block at a time**.
+For each batch, the script computes a set of block-level proxy scores, then computes `true_one_step_gain` for **all allowed candidate layers** by taking a single local update step on one block at a time. It then reports two evaluation views: (i) `all_layers`, which computes correlations over all allowed layers, and (ii) `topk_union`, which computes correlations only over the union of the per-proxy top-$k$ blocks.
 
 The suite reports, for each proxy:
 
@@ -16,6 +15,29 @@ The suite reports, for each proxy:
 - **Pearson** correlation with true gains
 - **top-k overlap** with the top-k blocks under true gains
 - **top-1 hit rate** against the top-1 block under true gains
+
+
+## Two correlation scopes
+
+The suite now saves **all-layer true gains** and reports two sets of metrics for every proxy:
+
+- `all_layers`
+  - Correlations and ranking metrics computed over **all allowed candidate layers**.
+- `topk_union`
+  - Correlations and ranking metrics computed over the union of each proxy's top-$k$ blocks.
+
+This makes it possible to distinguish:
+
+1. how well a proxy matches the true-gain ranking globally, and
+2. how well it behaves on the smaller subset of blocks that proxy-based selection would actually consider.
+
+Batch JSON files now contain:
+
+- `true_one_step_gains_all_layers`
+- `true_one_step_gains_topk_union`
+- `candidate_blocks_topk_union`
+- `metrics[proxy]['all_layers']`
+- `metrics[proxy]['topk_union']`
 
 ## Included proxies
 
