@@ -33,7 +33,7 @@ def main():
     parser.add_argument('--fisher-damping', type=float, default=1e-8)
     parser.add_argument('--output-dir', type=str, default=None)
     parser.add_argument('--proxies', nargs='*', default=None,
-                        help='Optional subset of proxies, e.g. adv_grad_energy fisher_diag_energy grad_norm lisa_score adagradselect_score random')
+                        help='Optional subset of proxies, e.g. adv_grad_energy no_adv_grad_energy fisher_diag_energy grad_norm lisa_score adagradselect_score random')
     args = parser.parse_args()
 
     cfg = load_config(args.config)

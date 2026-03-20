@@ -48,6 +48,9 @@ Batch JSON files now contain:
 abla_{	heta_b} \log \pi_	heta(a_t \mid s_t)],
     \quad U_b pprox \eta \|g_b\|^2
     \]
+- `no_adv_grad_energy`
+  - Ablation of `adv_grad_energy` that removes the advantage weighting and uses the masked mean log-probability objective.
+  - This isolates the contribution of the critic-induced advantage signal.
 - `fisher_diag_energy`
   - Diagonal empirical-Fisher approximation to the second-order form.
 - `grad_norm`
@@ -75,7 +78,7 @@ If you need paper-faithful reproductions, treat these as placeholders for Codex 
   - `bvou`
   - `bvou_lora`
 - Proxies:
-  - all seven above
+  - all eight above
 - Metrics:
   - Spearman
   - Pearson
@@ -128,3 +131,18 @@ If you want to fold this back into the main repo, the safest path is:
    - top-k overlap
    - top-1 hit rate
 4. Treat `lisa_score` and `adagradselect_score` as replaceable operational baselines.
+
+## Do YAML or shell launchers need to change?
+
+In the normal case, **no new YAML file is needed**.
+The new proxy is integrated as an internal proxy option inside `proxy_validity_stage1.py`, and it is included in the default proxy list when `--proxies` is omitted.
+
+You also usually do **not** need a new shell script.
+The only case where a launcher must change is if it explicitly hard-codes a proxy whitelist such as:
+
+```bash
+--proxies adv_grad_energy fisher_diag_energy grad_norm lisa_score adagradselect_score random
+```
+
+In that case, simply add `no_adv_grad_energy` to the existing list.
+No additional config file is required.

@@ -125,6 +125,24 @@ def compute_adv_grad_energy_scores(model, rollout, cfg, lora_enabled, allowed_bl
     return scores
 
 
+def compute_no_adv_grad_energy_scores(model, rollout, cfg, lora_enabled, allowed_blocks):
+    """Ablation of adv_grad_energy that removes the advantage weighting.
+
+    This computes block gradient energy for the masked mean log-probability objective,
+    i.e. the same score-function pathway without the critic-induced advantage signal.
+    """
+    named_params, grads = _named_params_and_grads_from_objective(model, rollout, cfg, lora_enabled, allowed_blocks, 'mean_logp')
+    per_block = _gather_grads_by_block(named_params, grads)
+    scores = {}
+    for block_idx, tensors in per_block.items():
+        score = 0.0
+        for grad in tensors:
+            score += float(grad.float().pow(2).sum().item())
+        scores[block_idx] = score
+    freeze_all_parameters(model)
+    return scores
+
+
 def compute_fisher_diag_energy_scores(model, rollout, cfg, lora_enabled, allowed_blocks, damping=1e-8):
     freeze_all_parameters(model)
     named_params = []
@@ -337,7 +355,7 @@ def run_proxy_validation_stage1(cfg: ExperimentConfig, checkpoint=None, split='v
 
     allowed_blocks = _allowed_block_indices(model, cfg)
     proxy_names = proxies or [
-        'adv_grad_energy', 'fisher_diag_energy', 'grad_norm', 'gate_grad', 'lisa_score', 'adagradselect_score', 'random'
+        'adv_grad_energy', 'no_adv_grad_energy', 'fisher_diag_energy', 'grad_norm', 'gate_grad', 'lisa_score', 'adagradselect_score', 'random'
     ]
     summary_acc = defaultdict(list)
     batch_summaries = []
@@ -350,6 +368,8 @@ def run_proxy_validation_stage1(cfg: ExperimentConfig, checkpoint=None, split='v
         for proxy in proxy_names:
             if proxy == 'adv_grad_energy':
                 score_maps[proxy] = compute_adv_grad_energy_scores(model, rollout, cfg, lora_enabled, allowed_blocks)
+            elif proxy in {'no_adv_grad_energy', 'logprob_grad_energy'}:
+                score_maps[proxy] = compute_no_adv_grad_energy_scores(model, rollout, cfg, lora_enabled, allowed_blocks)
             elif proxy == 'fisher_diag_energy':
                 score_maps[proxy] = compute_fisher_diag_energy_scores(model, rollout, cfg, lora_enabled, allowed_blocks, damping=fisher_damping)
             elif proxy == 'grad_norm':

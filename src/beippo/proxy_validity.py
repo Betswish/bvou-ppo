@@ -162,7 +162,7 @@ def generate_rollout_batch(model, reference_model, tokenizer, batch, cfg: Experi
     spec = resolve_model(cfg.train.model_name_or_path)
     generations = model.generate(
         **prompt_tokens,
-        do_sample=True,
+        do_sample=False,
         temperature=spec.recommended_temperature,
         top_p=spec.recommended_top_p,
         min_new_tokens=1,
