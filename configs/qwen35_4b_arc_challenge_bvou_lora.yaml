@@ -38,7 +38,7 @@ lora:
 selector:
   enabled: true
   scorer: adv_grad_energy
-  top_k: 8
+  top_k: 4
   select_every: 4
   active_only_optimizer_state: true
   candidate_last_n_layers: null

@@ -1,0 +1,108 @@
+# Proxy Validation Suite (Stage 1)
+
+This folder isolates the **stage-1 proxy validation** experiment from the larger `beippo` training repo.
+It is intended to answer the question:
+
+> Which block-utility proxy is closest to the ideal one-step block gain in RL post-training?
+
+## What this suite measures
+
+For each batch, the script computes a set of block-level proxy scores, then compares them against a
+`true_one_step_gain` target obtained by taking a **single local update step on one block at a time**.
+
+The suite reports, for each proxy:
+
+- **Spearman** correlation with true gains
+- **Pearson** correlation with true gains
+- **top-k overlap** with the top-k blocks under true gains
+- **top-1 hit rate** against the top-1 block under true gains
+
+## Included proxies
+
+- `adv_grad_energy`
+  - The main first-order proxy from the project:
+    \[
+    g_b = \mathbb{E}[A_t 
+abla_{	heta_b} \log \pi_	heta(a_t \mid s_t)],
+    \quad U_b pprox \eta \|g_b\|^2
+    \]
+- `fisher_diag_energy`
+  - Diagonal empirical-Fisher approximation to the second-order form.
+- `grad_norm`
+  - Generic PPO-gradient L2 norm baseline.
+- `gate_grad`
+  - Legacy gate-saliency proxy.
+- `lisa_score`
+  - **Operational baseline** approximating layer-importance style selection via size-normalized PPO gradient norm.
+- `adagradselect_score`
+  - **Operational baseline** approximating gradient-guided layer/block ranking via mean absolute PPO gradient.
+- `random`
+  - Deterministic random baseline.
+
+## Important note on LISA / AdaGradSelect baselines
+
+The implementations here are **block-level operational baselines**, not exact reproductions of the original papers.
+They are included so that proxy validation can compare against strong, familiar importance-scoring heuristics.
+If you need paper-faithful reproductions, treat these as placeholders for Codex to refine.
+
+## Recommended first experiment
+
+- Model: `Qwen/Qwen3.5-4B`
+- Task: `boolq`
+- Modes:
+  - `bvou`
+  - `bvou_lora`
+- Proxies:
+  - all seven above
+- Metrics:
+  - Spearman
+  - Pearson
+  - top-k overlap
+  - top-1 hit rate
+
+## Expected workflow
+
+1. Install `beippo` from the main repo.
+2. Copy this folder into the repo root, or call the script from this folder while `beippo` is importable.
+3. Run the provided command.
+4. Inspect `summary.json` and per-batch JSON files.
+
+## Example
+
+```bash
+python run_proxy_validation_stage1.py   --config config_templates/qwen35_4b_boolq_bvou_stage1.yaml   --mode bvou   --split validation   --max-samples 64   --max-batches 2   --top-k 8
+```
+
+For `bvou_lora`:
+
+```bash
+python run_proxy_validation_stage1.py   --config config_templates/qwen35_4b_boolq_bvou_lora_stage1.yaml   --mode bvou_lora   --split validation   --max-samples 64   --max-batches 2   --top-k 8
+```
+
+## Outputs
+
+By default the script writes to:
+
+```text
+outputs/<run_name>/proxy_validation_stage1/
+```
+
+Files:
+
+- `summary.json`
+- `batch_0000.json`
+- `batch_0001.json`
+- ...
+
+## Integration guidance for Codex
+
+If you want to fold this back into the main repo, the safest path is:
+
+1. Merge `proxy_validity_stage1.py` into `src/beippo/proxy_validity.py`.
+2. Merge `run_proxy_validation_stage1.py` into `scripts/run_proxy_validity.py`.
+3. Keep the stage-1 metrics protocol stable:
+   - Spearman
+   - Pearson
+   - top-k overlap
+   - top-1 hit rate
+4. Treat `lisa_score` and `adagradselect_score` as replaceable operational baselines.
