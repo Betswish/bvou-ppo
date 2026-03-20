@@ -1,0 +1,31 @@
+train:
+  run_name: qwen35_4b_boolq_bvou_lora_stage1
+  model_name_or_path: Qwen/Qwen3.5-4B
+  # output_dir: outputs/qwen35_4b_boolq_bvou_lora_stage1
+  # task_name: boolq
+  # output_dir: outputs/qwen35_4b_arc_challenge_bvou_lora_stage1
+  # task_name: arc_challenge
+  output_dir: outputs/qwen35_4b_commonsenseqa_bvou_lora_stage1
+  task_name: commonsenseqa
+  per_device_batch_size: 2
+  enable_thinking: false
+  use_official_system_prompt: false
+  seed: 42
+
+lora:
+  enabled: true
+  r: 16
+  alpha: 32
+  dropout: 0.05
+  target_modules: [q_proj, k_proj, v_proj, o_proj]
+
+selector:
+  candidate_last_n_layers: null
+  candidate_start_layer: null
+  candidate_end_layer: null
+  search_upper_half_only: false
+
+ppo:
+  clip_range: 0.2
+  value_coef: 0.5
+  kl_coef: 0.0

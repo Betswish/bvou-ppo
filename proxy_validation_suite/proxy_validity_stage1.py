@@ -1,4 +1,5 @@
 from __future__ import annotations
+from tqdm import tqdm
 
 import json
 import math
@@ -311,7 +312,7 @@ def run_proxy_validation_stage1(cfg: ExperimentConfig, checkpoint=None, split='v
 
     if output_dir is None:
         output_dir = cfg.train.output_dir
-    out_root = Path(output_dir) / 'proxy_validation_stage1'
+    out_root = Path(output_dir+f"_{max_samples}_{max_batches}_{top_k}") / 'proxy_validation_stage1'
     out_root.mkdir(parents=True, exist_ok=True)
 
     allowed_blocks = _allowed_block_indices(model, cfg)
@@ -321,7 +322,7 @@ def run_proxy_validation_stage1(cfg: ExperimentConfig, checkpoint=None, split='v
     summary_acc = defaultdict(list)
     batch_summaries = []
 
-    for batch_idx, batch in enumerate(loader):
+    for batch_idx, batch in enumerate(tqdm(loader)):
         if batch_idx >= max_batches:
             break
         rollout, metadata = generate_rollout_batch(model, reference_model, tokenizer, batch, cfg)
