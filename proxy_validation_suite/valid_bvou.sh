@@ -5,4 +5,5 @@ CUDA_VISIBLE_DEVICES=0 \
 		--split validation   \
 		--max-samples 512   \
 		--max-batches 64   \
-		--top-k 4
+		--top-k 4 \
+		--step-size 1e-5
