@@ -1,0 +1,49 @@
+train:
+  run_name: qwen35_4b_gsm8k_bvou_lora
+  output_dir: outputs/qwen35_4b_gsm8k_bvou_lora
+  model_name_or_path: Qwen/Qwen3.5-4B
+  model_family: qwen35
+  task_name: gsm8k
+  train_split: train
+  eval_splits:
+  - test
+  enable_thinking: false
+  use_official_system_prompt: false
+  max_train_samples: 7500
+  max_eval_samples: 1000
+  per_device_batch_size: 1
+  gradient_accumulation_steps: 16
+  response_max_new_tokens: 8196
+  num_train_steps: 500
+  learning_rate: 1.5e-05
+  full_tune: false
+  gradient_checkpointing: true
+  save_every: 100
+  eval_every: 100
+  report_to: none
+  prompt_max_length: 1024
+  weight_decay: 0.01
+  warmup_ratio: 0.03
+  bf16: true
+lora:
+  enabled: true
+  r: 16
+  alpha: 32
+  dropout: 0.05
+  target_modules:
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+selector:
+  enabled: true
+  scorer: adv_grad_energy
+  top_k: 6
+  select_every: 1
+  search_upper_half_only: false
+  active_only_optimizer_state: false
+rollouts:
+  save_train_rollouts: false
+  save_eval_rollouts: false
+  max_train_rollouts_per_save: 0
+  max_eval_rollouts_per_save: 0

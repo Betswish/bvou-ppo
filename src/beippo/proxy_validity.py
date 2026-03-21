@@ -117,6 +117,7 @@ def _collect_block_params(model, lora_enabled: bool) -> dict[int, list[tuple[str
 
 def _apply_lora_if_needed(model, cfg: ExperimentConfig):
     if cfg.lora.enabled:
+        from beippo.models.policy_value_model import apply_lora
         model = apply_lora(model, cfg.lora.r, cfg.lora.alpha, cfg.lora.dropout, cfg.lora.target_modules)
     return model
 
